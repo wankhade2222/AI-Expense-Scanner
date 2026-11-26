@@ -4,4 +4,5 @@ backend/*
 !backend/Dockerfile
 !backend/main.py
 !backend/extraction.py
+!backend/validation.py
 !backend/requirements.txt

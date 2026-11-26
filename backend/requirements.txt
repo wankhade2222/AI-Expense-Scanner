@@ -9,3 +9,4 @@ rq
 pillow
 pypdfium2
 httpx
+babel

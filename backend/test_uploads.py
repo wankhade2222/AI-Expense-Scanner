@@ -11,7 +11,9 @@ from PIL import Image
 from sqlalchemy import create_engine
 
 from backend import main
+from backend.extraction import ExtractionResult
 from backend.extraction_samples import SAMPLES, render_sample
+from backend.test_validation import invoice
 
 
 class UploadTests(unittest.TestCase):
@@ -133,3 +135,20 @@ class UploadTests(unittest.TestCase):
             self.assertNotEqual(first["id"], latest["id"])
             with main.Session(main.engine) as session:
                 self.assertIsNotNone(session.get(main.Extraction, first["id"]))
+
+    def test_near_duplicates_are_detected_in_both_directions(self):
+        photo = io.BytesIO()
+        Image.new("RGB", (30, 50)).save(photo, "JPEG")
+        documents = []
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}):
+            for index, invoice_number in enumerate(("INV-42", "inv-42", "INV-43")):
+                fields = invoice(invoice_number=invoice_number, document_date="2025-09-01")
+                with patch.object(main, "extract_receipt", return_value=ExtractionResult(fields, {}, "fixture", 2)):
+                    uploaded = self.upload(f"invoice-{index}.jpg", photo.getvalue() + bytes([index]))
+                documents.append(uploaded.json()["id"])
+        for index, document in enumerate(documents):
+            response = self.client.get(f"/api/receipts/{document}/extraction")
+            self.assertEqual(response.status_code, 200)
+            report = response.json()["validation"]
+            self.assertEqual(report["totals_check"], "matched")
+            self.assertEqual(any(flag["code"] == "possible_duplicate" for flag in report["flags"]), index < 2)
