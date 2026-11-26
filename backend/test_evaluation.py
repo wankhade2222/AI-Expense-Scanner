@@ -57,3 +57,11 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(comparison["field_deltas"]["merchant"]["missed_errors"], -1)
         with self.assertRaises(ValueError):
             evaluate.compare_reports(new, {**old, "dataset_version": "other"})
+
+    def test_resume_reuses_only_scored_cases_with_matching_versions(self):
+        clean = evaluate.evaluate(evaluate.CASES[0], None, evaluate.VALIDATION_DATE)
+        failed = {"id": evaluate.CASES[1].case_id, "error": "Service unavailable", "http_status": 429}
+        report = evaluate.build_report([clean, failed], None, evaluate.VALIDATION_DATE)
+        self.assertEqual(evaluate.resumable_cases(report, None, evaluate.VALIDATION_DATE), {clean["id"]: clean})
+        with self.assertRaisesRegex(ValueError, "prompt_version"):
+            evaluate.resumable_cases({**report, "prompt_version": "other"}, None, evaluate.VALIDATION_DATE)

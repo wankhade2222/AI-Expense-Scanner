@@ -135,6 +135,24 @@ def transient_error(error: ExtractionError) -> bool:
     )
 
 
+def failure_details(error: ExtractionError) -> dict:
+    cause = error.__cause__
+    if not isinstance(cause, httpx.HTTPStatusError):
+        return {}
+    status = cause.response.status_code
+    details = {"http_status": status}
+    if status == 429:
+        try:
+            provider_details = cause.response.json().get("error", {}).get("details", [])
+            ids = {violation["quotaId"] for item in provider_details for violation in item.get("violations", [])
+                   if isinstance(violation.get("quotaId"), str)}
+            if ids:
+                details["quota_ids"] = sorted(ids)
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return details
+
+
 def evaluate(case: Case, config: ExtractionConfig | None, validation_date: date) -> dict:
     result = {"id": case.case_id, "merchant": case.sample.merchant}
     if config is None:
@@ -151,7 +169,7 @@ def evaluate(case: Case, config: ExtractionConfig | None, validation_date: date)
                 if attempt == 1 and transient_error(exc):
                     sleep(3)
                 else:
-                    return {**result, "attempts": attempt, "error": str(exc)}
+                    return {**result, "attempts": attempt, "error": str(exc), **failure_details(exc)}
     return {
         **result, "model": model,
         **score_case(case, fields, validate_receipt(fields, today=validation_date)),
@@ -189,6 +207,14 @@ def compare_reports(current: dict, previous: dict) -> dict:
     }
 
 
+def resumable_cases(previous: dict, config: ExtractionConfig | None, validation_date: date) -> dict[str, dict]:
+    expected = build_report([], config, validation_date)
+    for key in ("report_version", "dataset_version", "validation_date", "provider", "requested_model", "prompt_version", "rules_version"):
+        if expected[key] != previous[key]:
+            raise ValueError(f"Previous run differs in {key}. Use the same configuration or start a new run.")
+    return {case["id"]: case for case in previous["cases"] if "fields" in case}
+
+
 def print_report(report: dict) -> None:
     print(f"Provider: {report['provider']} | Models: {', '.join(report['model_versions']) or 'none returned'}")
     print(f"Prompt: {report['prompt_version']} | Rules: {report['rules_version']} | As of: {report['validation_date']}")
@@ -214,6 +240,7 @@ def main() -> int:
     parser.add_argument("--as-of", type=date.fromisoformat, default=VALIDATION_DATE)
     parser.add_argument("--output", type=Path, help="Write the detailed JSON report.")
     parser.add_argument("--compare", type=Path, help="Compare the metrics on overlapping cases from an earlier JSON report.")
+    parser.add_argument("--resume", type=Path, help="Reuse successful cases from a compatible report and evaluate the remaining ones.")
     args = parser.parse_args()
     config = None
     if args.live:
@@ -223,13 +250,24 @@ def main() -> int:
             parser.error(str(exc))
         if config is None:
             parser.error("--live requires a configured extraction provider API key.")
+    scored = {}
+    if args.resume:
+        try:
+            scored = resumable_cases(json.loads(args.resume.read_text(encoding="utf-8")), config, args.as_of)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error(f"Could not resume the report. {exc}")
     selected = CASES[:args.limit]
-    cases = []
+    pending = [case for case in selected if case.case_id not in scored]
+    if args.resume:
+        print(f"Reusing {len(selected) - len(pending)} scored documents. Evaluating {len(pending)} remaining.")
     with ThreadPoolExecutor(max_workers=2 if args.live else 1) as executor:
-        for result in executor.map(lambda case: evaluate(case, config, args.as_of), selected):
-            cases.append(result)
+        for result in executor.map(lambda case: evaluate(case, config, args.as_of), pending):
+            scored[result["id"]] = result
             if args.live:
-                print(result["id"] + ": " + result.get("error", "scored"), flush=True)
+                quota = ", ".join(result.get("quota_ids", []))
+                suffix = f" ({quota})" if quota else ""
+                print(result["id"] + ": " + result.get("error", "scored") + suffix, flush=True)
+    cases = [scored[case.case_id] for case in selected]
     report = build_report(cases, config, args.as_of)
     if args.compare:
         try:
