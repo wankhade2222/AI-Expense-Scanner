@@ -6,4 +6,5 @@ backend/*
 !backend/extraction.py
 !backend/extraction_samples.py
 !backend/validation.py
+!backend/tracker.py
 !backend/requirements.txt

@@ -1,5 +1,11 @@
 # AI Expense Scanner
 
+## M5 bills and spending
+
+Choose a suggested category in Review, or change the category later in either tracker view. **Bills to pay** lists confirmed unpaid documents, with overdue bills and missing due dates marked. **Mark as paid** records the full payment on the date entered and moves the bill to the corresponding **Monthly spending** view. Monthly totals are grouped by currency and category. **Export CSV** uses the filters currently selected on the tracker.
+
+Run `./.venv/Scripts/python.exe -m unittest backend.test_validation backend.test_uploads` to test confirmation, payment, categorization, reporting, and export with synthetic data and mocked extraction.
+
 ## M4 review and confirmation
 
 Select **Review** on a Ready document with a completed extraction. Flagged fields appear first. Select **Edit** to change a field and see a source crop or page when available. Each saved change creates an audit entry and reruns the validation rules. Resolve required flags, then select **Confirm document**. The tracker record keeps the reviewed values and version.

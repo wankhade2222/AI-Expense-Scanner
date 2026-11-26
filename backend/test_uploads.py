@@ -1,6 +1,7 @@
 import io
 import os
 import unittest
+from csv import DictReader
 from json import dumps
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -252,3 +253,65 @@ class UploadTests(unittest.TestCase):
             self.assertEqual([(row.field, row.previous_value, row.new_value) for row in corrections], [
                 ("currency", None, "INR"), ("total", "1500", "1416"),
             ])
+
+    def test_tracker_moves_bill_to_payment_month_and_exports_filtered_rows(self):
+        def confirm(filename, sample, fields, category=None):
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}), patch.object(
+                main, "extract_receipt", return_value=ExtractionResult(fields, {}, "fixture", 2),
+            ):
+                uploaded = self.upload(filename, render_sample(sample)[0])
+            self.assertEqual(uploaded.status_code, 202)
+            receipt_id = uploaded.json()["id"]
+            review = self.client.get(f"/api/receipts/{receipt_id}/review").json()
+            approved = self.client.post(
+                f"/api/receipts/{receipt_id}/approve", json={**review["version"], "category": category},
+            )
+            self.assertEqual(approved.status_code, 200, approved.text)
+            return receipt_id
+
+        unpaid = confirm("bill.pdf", SAMPLES[10], invoice(
+            merchant="Paper Fern", document_date="2025-11-26", due_date="2025-12-10", total="12000",
+            subtotal=None, tax=None,
+        ), "Professional services")
+        paid = confirm("paid.jpg", SAMPLES[0], invoice(
+            merchant="=1+1", document_type="receipt", document_date="2025-12-02",
+            payment_status="paid", payment_date="2025-12-02", currency="USD", invoice_number=None,
+            due_date=None, subtotal="30.01", tax=None, rounding="-0.01", total="30",
+        ))
+        # A confirmed M4 expense can be read and categorized before it has a tracking row.
+        with main.Session(main.engine) as session:
+            session.delete(session.get(main.ExpenseTracking, paid))
+            session.commit()
+
+        bills = self.client.get("/api/expenses?status=unpaid").json()["expenses"]
+        self.assertEqual([(bill["receipt_id"], bill["overdue"], bill["category"]) for bill in bills],
+                         [(unpaid, True, "Professional services")])
+        self.assertEqual(self.client.get("/api/expenses?status=paid&month=2025-11").json()["totals"], [])
+        path = f"/api/expenses/{unpaid}/mark-paid"
+        self.assertEqual(self.client.post(path, json={"paid_on": "2025-02-30"}).status_code, 422)
+        self.assertEqual(self.client.post(path, json={"paid_on": "9999-12-31"}).status_code, 422)
+        for _ in range(2):
+            recorded = self.client.post(path, json={"paid_on": "2025-12-05"})
+            self.assertEqual(recorded.status_code, 200, recorded.text)
+            self.assertEqual(recorded.json()["paid_on"], "2025-12-05")
+        self.assertEqual(self.client.post(path, json={"paid_on": "2025-12-06"}).status_code, 409)
+        self.assertEqual(self.client.get("/api/expenses?status=unpaid").json()["expenses"], [])
+        self.assertEqual(self.client.get("/api/expenses?status=paid&month=2025-11").json()["totals"], [])
+        changed = self.client.patch(f"/api/expenses/{paid}/category", json={"category": "Meals"})
+        self.assertEqual(changed.status_code, 200, changed.text)
+
+        december = self.client.get("/api/expenses?status=paid&month=2025-12").json()
+        self.assertEqual([item["receipt_id"] for item in december["expenses"]], [unpaid, paid])
+        self.assertEqual([(row["currency"], row["total_minor"]) for row in december["totals"]],
+                         [("INR", "1200000"), ("USD", "3000")])
+        self.assertEqual([(row["category"], row["amount"]) for row in december["category_totals"]],
+                         [("Professional services", "12000.00"), ("Meals", "30.00")])
+        filters = "?status=paid&month=2025-12&category=Meals"
+        visible = self.client.get("/api/expenses" + filters).json()["expenses"]
+        exported = self.client.get("/api/expenses/export.csv" + filters)
+        self.assertEqual(exported.status_code, 200)
+        rows = list(DictReader(io.StringIO(exported.text)))
+        self.assertEqual(len(rows), len(visible))
+        self.assertEqual((rows[0]["Merchant"], rows[0]["Currency"], rows[0]["Paid on"]),
+                         ("'=1+1", "USD", "2025-12-02"))
+        self.assertEqual((rows[0]["Subtotal"], rows[0]["Rounding"]), ("30.01", "-0.01"))
