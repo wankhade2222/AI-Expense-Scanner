@@ -60,6 +60,9 @@ dialog::backdrop { background: #0e211dc0; }
 .dialog-title h2 { overflow-wrap: anywhere; }
 .preview { display: block; width: 100%; max-height: 69vh; object-fit: contain; background: #f4f7f6; }
 .original { display: inline-block; margin-top: 12px; color: #17654e; font-weight: 650; }
+.extracted { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 12px 0; padding: 12px; border-radius: 8px; background: #eef4f1; }
+.extracted dt { color: #526660; font-size: .875rem; }
+.extracted dd { margin: 4px 0 0; overflow-wrap: anywhere; }
 @keyframes rotate { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .status.processing svg, .spin { animation: none; } }
 @media (max-width: 700px) {

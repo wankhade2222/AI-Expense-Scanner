@@ -4,6 +4,8 @@ x-backend: &backend
     dockerfile: backend/Dockerfile
   environment:
     PYTHONPATH: /app
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
     DATABASE_URL: postgresql+psycopg://scanner:scanner@db/scanner
     REDIS_URL: redis://redis:6379/0
     DATA_DIR: /data
