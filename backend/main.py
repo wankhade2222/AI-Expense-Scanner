@@ -3,7 +3,7 @@ import io
 import logging
 import os
 from contextlib import asynccontextmanager, closing
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -15,12 +15,16 @@ import pypdfium2 as pdfium
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile, status
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, case, create_engine, select, update
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, String, UniqueConstraint, case, create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt, extraction_config
-from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, validate_receipt
+from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, parse_date, validate_receipt
+from backend.tracker import (
+    CATEGORIES, CategoryRequest, ExpenseReport, PaymentRequest, TrackerExpense, expense_csv,
+    summarize, today_utc, tracker_category, tracker_expense,
+)
 
 logger = logging.getLogger(__name__)
 data_dir = Path(os.getenv("DATA_DIR", ".data")).resolve()
@@ -137,6 +141,14 @@ class Expense(Base):
     confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ExpenseTracking(Base):
+    __tablename__ = "expense_tracking"
+
+    receipt_id: Mapped[str] = mapped_column(ForeignKey("expenses.receipt_id"), primary_key=True)
+    category: Mapped[str | None] = mapped_column(String(40))
+    paid_on: Mapped[date | None] = mapped_column(Date)
+
+
 class ReviewVersion(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     extraction_id: str
@@ -147,11 +159,17 @@ class EditRequest(ReviewVersion):
     value: str | None = Field(max_length=1000)
 
 
+class ApprovalRequest(ReviewVersion):
+    category: str | None = None
+
+
 class ReviewView(BaseModel):
     version: ReviewVersion
     fields: ReceiptExtraction
     validation: ValidationReport
     confirmed: bool
+    category: str
+    categories: tuple[str, ...] = CATEGORIES
 
 
 def validation_for(extraction_id: str, fields: ReceiptExtraction) -> SavedValidation:
@@ -566,9 +584,11 @@ def load_review(session: Session, receipt_id: str) -> tuple[Receipt, Review | No
     review = session.get(Review, extraction.id)
     fields = ReceiptExtraction.model_validate(expense.fields if expense else review.fields if review else extraction.fields)
     saved = validation_for(extraction.id, fields)
+    tracking = session.get(ExpenseTracking, receipt_id) if expense else None
     return receipt, review, ReviewView(
         version=ReviewVersion(extraction_id=extraction.id, revision=review.revision if review else 0),
         fields=fields, validation=report_with_duplicates(session, saved, receipt), confirmed=expense is not None,
+        category=(tracking.category if tracking else None) or tracker_category(fields.model_dump()),
     )
 
 
@@ -635,7 +655,7 @@ def edit_field(receipt_id: str, field: str, edit: EditRequest) -> ReviewView:
 
 
 @app.post("/api/receipts/{receipt_id}/approve")
-def approve_receipt(receipt_id: str, version: ReviewVersion) -> ReviewView:
+def approve_receipt(receipt_id: str, version: ApprovalRequest) -> ReviewView:
     with Session(engine) as session:
         lock_receipt(session, receipt_id)
         _, _, current = load_review(session, receipt_id)
@@ -645,13 +665,17 @@ def approve_receipt(receipt_id: str, version: ReviewVersion) -> ReviewView:
         currency = current.validation.currency
         if currency is None or any(flag.severity == "blocking" for flag in current.validation.flags):
             raise HTTPException(422, "Resolve the required flags before confirming.")
+        category = version.category or current.category
+        validate_category(category)
         session.add(Expense(
             receipt_id=receipt_id, extraction_id=version.extraction_id, revision=version.revision,
             fields=current.fields.model_dump(), currency=currency, amounts_minor=current.validation.amounts_minor,
             confirmed_at=datetime.now(timezone.utc),
         ))
+        session.flush()
+        session.add(ExpenseTracking(receipt_id=receipt_id, category=category))
         session.commit()
-        return current.model_copy(update={"confirmed": True})
+        return current.model_copy(update={"confirmed": True, "category": category})
 
 
 @app.get("/api/receipts/{receipt_id}/review/source")
@@ -680,3 +704,103 @@ def review_source(receipt_id: str, field: str, extraction_id: str) -> Response:
         output = io.BytesIO()
         image.save(output, "JPEG", quality=88)
         return Response(output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+
+
+def validate_category(category: str) -> None:
+    if category not in CATEGORIES:
+        raise HTTPException(422, "Choose a category from the list.")
+
+
+def expense_view(expense: Expense, tracking: ExpenseTracking | None) -> TrackerExpense:
+    return tracker_expense(
+        expense.receipt_id, expense.fields, expense.currency, expense.amounts_minor,
+        paid_on=tracking.paid_on if tracking else None, category=tracking.category if tracking else None,
+    )
+
+
+def filtered_expenses(
+    session: Session, payment_status: str, month: str | None, category: str | None,
+) -> list[TrackerExpense]:
+    if month is not None:
+        if payment_status != "paid":
+            raise HTTPException(422, "A payment month can only filter paid expenses.")
+        try:
+            parse_date(month + "-01")
+        except ValueError as exc:
+            raise HTTPException(422, "Enter a month in YYYY-MM format.") from exc
+    if category is not None:
+        validate_category(category)
+    rows = session.execute(
+        select(Expense, ExpenseTracking).join(Receipt, Expense.receipt_id == Receipt.id)
+        .outerjoin(ExpenseTracking).where(Receipt.user_id == owner)
+    )
+    expenses = []
+    for expense, tracking in rows:
+        current = expense_view(expense, tracking)
+        if current.status != payment_status or (category and category != current.category):
+            continue
+        if month is None or (current.paid_on and current.paid_on.isoformat()[:7] == month):
+            expenses.append(current)
+    if payment_status == "unpaid":
+        return sorted(expenses, key=lambda row: (row.due_date or date.max, row.document_date, row.receipt_id))
+    return sorted(expenses, key=lambda row: (row.paid_on or date.min, row.receipt_id), reverse=True)
+
+
+@app.get("/api/expenses")
+def list_expenses(status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> ExpenseReport:
+    with Session(engine) as session:
+        return summarize(filtered_expenses(session, status, month, category))
+
+
+@app.get("/api/expenses/export.csv")
+def export_expenses(status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> Response:
+    with Session(engine) as session:
+        rows = filtered_expenses(session, status, month, category)
+    return Response(
+        expense_csv(rows), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="expenses.csv"', "Cache-Control": "private, no-store"},
+    )
+
+
+def lock_expense(session: Session, receipt_id: str) -> tuple[Expense, ExpenseTracking]:
+    lock_receipt(session, receipt_id)
+    expense = session.get(Expense, receipt_id)
+    if expense is None:
+        raise HTTPException(404, "Confirmed expense not found.")
+    tracking = session.get(ExpenseTracking, receipt_id)
+    if tracking is None:
+        tracking = ExpenseTracking(receipt_id=receipt_id)
+        session.add(tracking)
+    return expense, tracking
+
+
+@app.post("/api/expenses/{receipt_id}/mark-paid")
+def mark_paid(receipt_id: str, request: PaymentRequest) -> TrackerExpense:
+    try:
+        paid_on = parse_date(request.paid_on)
+    except ValueError as exc:
+        raise HTTPException(422, "Enter a valid payment date in YYYY-MM-DD format.") from exc
+    if paid_on > today_utc():
+        raise HTTPException(422, "A completed payment cannot have a future date.")
+    with Session(engine) as session:
+        expense, tracking = lock_expense(session, receipt_id)
+        current = expense_view(expense, tracking)
+        if current.paid_on is not None:
+            if current.paid_on == paid_on:
+                return current
+            raise HTTPException(409, "This expense already has a different payment date.")
+        tracking.paid_on = paid_on
+        result = expense_view(expense, tracking)
+        session.commit()
+        return result
+
+
+@app.patch("/api/expenses/{receipt_id}/category")
+def change_category(receipt_id: str, request: CategoryRequest) -> TrackerExpense:
+    validate_category(request.category)
+    with Session(engine) as session:
+        expense, tracking = lock_expense(session, receipt_id)
+        tracking.category = request.category
+        result = expense_view(expense, tracking)
+        session.commit()
+        return result

@@ -15,6 +15,9 @@ button:disabled { opacity: .6; cursor: wait; }
 .brand { display: flex; align-items: center; gap: 11px; font-weight: 730; font-size: 1rem; white-space: nowrap; }
 .brand-icon { width: 37px; height: 37px; background: #2c554a; border-radius: 10px; display: grid; place-items: center; color: #a4edcd; }
 nav { margin-top: 44px; }
+nav a + a { margin-top: 5px; }
+nav a:not([aria-current]) { background: transparent; color: #c5ded5; }
+nav a:hover { background: #22463d; }
 nav a { display: flex; align-items: center; gap: 10px; padding: 11px 12px; background: #22463d; border-radius: 8px; text-decoration: none; color: #e4fbf2; font-size: .94rem; font-weight: 600; }
 main { min-width: 0; max-width: 1140px; width: 100%; margin: 0 auto; padding: 55px clamp(24px, 5vw, 74px); }
 h1, h2, h3, p { margin: 0; }
@@ -74,6 +77,30 @@ dialog::backdrop { background: #0e211dc0; }
 .review-source figcaption { color: #526660; font-size: .875rem; margin-top: 4px; }
 .review-footer { position: sticky; bottom: 0; background: #fff; padding-top: 12px; }
 .review-confirm { width: 100%; }
+.review-category { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.review-category select { flex: 1; min-width: 0; }
+.review-category select, .tracker-filters select, .tracker-filters input, .tracker-row select, .payment-form input {
+  min-height: 39px; max-width: 100%; padding: 6px 9px; border: 1px solid #9eafa9; border-radius: 7px;
+  background: white; color: #162724; font: inherit;
+}
+.tracker-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.tracker-export { display: inline-flex; align-items: center; gap: 7px; padding: 9px 12px; border: 1px solid #9eafa9; border-radius: 8px; text-decoration: none; background: #fff; color: #17654e; font-weight: 650; }
+.tracker-filters, .payment-form { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; }
+.tracker-filters label, .payment-form label { display: grid; gap: 5px; font-weight: 600; font-size: .9rem; }
+.tracker-loading { margin: 18px 0; }
+.tracker-summary { margin: 22px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; }
+.tracker-summary > div { display: grid; gap: 6px; background: #e6f5ee; border: 1px solid #c8e4d7; border-radius: 12px; padding: 15px; overflow-wrap: anywhere; }
+.tracker-summary strong { font-size: 1.45rem; }
+.tracker-summary span { color: #465f55; }
+.category-summary { background: #fff; border: 1px solid #dbe6e1; border-radius: 12px; padding: 14px 17px; }
+.category-summary ul { display: grid; gap: 8px; padding: 0; margin: 12px 0 0; list-style: none; }
+.category-summary li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 15px; }
+.tracker-list { margin-top: 22px; }
+.tracker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 13px 17px; }
+.tracker-row + .tracker-row { border-top: 1px solid #e4ece8; }
+.tracker-merchant { flex: 1 1 145px; min-width: 0; display: grid; overflow-wrap: anywhere; }
+.tracker-amount { overflow-wrap: anywhere; }
+.payment-form { width: 100%; border-top: 1px solid #e4ece8; padding-top: 10px; }
 .review-confirmed { color: #175c44; font-weight: 650; }
 @media (max-width: 680px) {
   .review-layout { grid-template-columns: minmax(0, 1fr); }
@@ -84,8 +111,9 @@ dialog::backdrop { background: #0e211dc0; }
 @media (prefers-reduced-motion: reduce) { .status.processing svg, .spin { animation: none; } }
 @media (max-width: 700px) {
   .layout { display: block; }
-  .sidebar { padding: 13px 18px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
-  nav { margin: 0; }
+  .sidebar { padding: 13px 18px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  nav { margin: 0; display: flex; flex-wrap: wrap; gap: 3px; }
+  nav a + a { margin: 0; }
   nav a { padding: 8px; }
   nav svg { display: none; }
   main { padding: 27px 16px; }

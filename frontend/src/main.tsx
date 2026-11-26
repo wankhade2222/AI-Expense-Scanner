@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { AlertCircle, Camera, CheckCircle2, Clock3, FileText, FolderOpen, LoaderCircle, ReceiptText, RotateCw, UploadCloud, X } from 'lucide-react'
+import { AlertCircle, BarChart3, Camera, CheckCircle2, Clock3, FileText, FolderOpen, LoaderCircle, ReceiptText, RotateCw, UploadCloud, Wallet, X } from 'lucide-react'
 import './styles.css'
 import ReviewCard from './ReviewCard'
+import Tracker from './Tracker'
 
 type Receipt = {
   id: string
@@ -19,6 +20,12 @@ type Receipt = {
 const statusLabels = { queued: 'Queued', processing: 'Processing', ready: 'Ready', failed: 'Failed' }
 const dateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 const supported = 'image/jpeg,image/png,image/webp,application/pdf,.pdf'
+const pages = [
+  { id: 'documents', label: 'Documents', icon: FolderOpen },
+  { id: 'bills', label: 'Bills to pay', icon: Wallet },
+  { id: 'spending', label: 'Monthly spending', icon: BarChart3 },
+] as const
+const activePage = () => pages.find(item => `#${item.id}` === window.location.hash)?.id ?? 'documents'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`/api/receipts${path}`, options)
@@ -39,6 +46,7 @@ function Status({ status }: { status: Receipt['status'] }) {
 }
 
 function App() {
+  const [page, setPage] = useState(activePage)
   const [receipts, setReceipts] = useState<Receipt[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -65,6 +73,16 @@ function App() {
   }, [])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  useEffect(() => {
+    function navigate() {
+      const next = activePage()
+      if (next !== 'documents') setSelected(null)
+      setPage(next)
+    }
+    window.addEventListener('hashchange', navigate)
+    return () => window.removeEventListener('hashchange', navigate)
+  }, [])
 
   useEffect(() => {
     if (!processing) return
@@ -122,10 +140,10 @@ function App() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-icon"><ReceiptText size={22} /></span><span>Expense Scanner</span></div>
         <nav aria-label="Workspace">
-          <a href="#documents" aria-current="page"><FolderOpen size={19} /> Documents</a>
+          {pages.map(({ id, label, icon: Icon }) => <a key={id} href={`#${id}`} aria-current={page === id ? 'page' : undefined}><Icon size={19} />{label}</a>)}
         </nav>
       </aside>
-      <main id="documents">
+      {page === 'documents' ? <main id="documents">
         <header>
           <h1>Documents</h1>
           <p>Upload and manage your business receipts and invoices.</p>
@@ -205,7 +223,7 @@ function App() {
             </div>
           </>}
         </dialog>
-      </main>
+      </main> : <Tracker key={page} mode={page} />}
     </div>
   )
 }

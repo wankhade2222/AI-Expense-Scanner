@@ -15,6 +15,8 @@ type Review = {
   }
   validation: { flags: Flag[] }
   confirmed: boolean
+  category: string
+  categories: string[]
 }
 
 const labels: Record<string, string> = {
@@ -32,6 +34,7 @@ const lineLabels = { description: 'description', qty: 'quantity', unit_price: 'u
 export default function ReviewCard({ receiptId }: { receiptId: string }) {
   const [review, setReview] = useState<Review | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
+  const [category, setCategory] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -84,6 +87,7 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
     setError('')
     setReview(null)
     setEditing(null)
+    setCategory(null)
     setLoaded(false)
     setReload(previous => previous + 1)
   }
@@ -146,8 +150,13 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
         </div>
       ))}
     </div>
-    <div className="review-footer">{review.confirmed ? <p className="review-confirmed" role="status">Confirmed</p> :
+    <div className="review-footer">{review.confirmed ? <p className="review-confirmed" role="status">Confirmed · {review.category}</p> : <>
+      <label className="review-category">Category
+        <select value={category ?? review.category} onChange={event => setCategory(event.target.value)} disabled={busy}>
+          {review.categories.map(name => <option key={name}>{name}</option>)}
+        </select>
+      </label>
       <button type="button" className="primary review-confirm" disabled={busy || editing !== null || flags.some(flag => flag.severity === 'blocking')}
-        onClick={() => void change('/approve', 'POST', {})}>Confirm document</button>}</div>
+        onClick={() => void change('/approve', 'POST', { category: category ?? review.category })}>Confirm document</button></>}</div>
   </section>
 }
