@@ -19,6 +19,10 @@ class Sample:
     payment_status: str
     due_date: str | None = None
     pages: int = 1
+    subtotal: str | None = None
+    tax: str | None = None
+    tax_included: bool = False
+    obscure_total: bool = False
 
     @property
     def document_type(self):
@@ -61,12 +65,22 @@ def render_sample(sample: Sample) -> tuple[bytes, str]:
             if sample.due_date:
                 lines.extend(["Invoice number: T-" + sample.document_date[-2:], f"Due date: {sample.due_date}"])
         if number == sample.pages:
-            lines += [f"Total: {sample.total}"]
+            if sample.subtotal is not None:
+                lines.append(f"Subtotal: {sample.subtotal}")
+            if sample.tax is not None:
+                label = "Tax included" if sample.tax_included else "Tax"
+                lines.append(f"{label}: {sample.tax}")
+            lines.append(f"Total: {sample.total}")
+            total_line = len(lines)
             if sample.payment_status != "unknown":
                 lines.append(f"Payment status: {sample.payment_status.upper()}")
             if sample.payment_status == "paid":
                 lines.append(f"Payment date: {sample.document_date}")
         draw.multiline_text((48, 35), "\n".join(lines), font=font, fill="black", spacing=11)
+        if sample.obscure_total and number == sample.pages:
+            total_bottom = draw.multiline_textbbox((48, 35), "\n".join(lines[:total_line]), font=font, spacing=11)[3]
+            amount_left = 48 + font.getlength("Total: ")
+            draw.rectangle((amount_left - 2, total_bottom - 30, amount_left + 145, total_bottom + 4), fill="#666666")
         images.append(image)
     target = io.BytesIO()
     if sample.document_type == "invoice":
