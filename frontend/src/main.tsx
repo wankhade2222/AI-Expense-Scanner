@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { AlertCircle, Camera, CheckCircle2, Clock3, FileText, FolderOpen, LoaderCircle, ReceiptText, RotateCw, UploadCloud, X } from 'lucide-react'
 import './styles.css'
+import ReviewCard from './ReviewCard'
 
 type Receipt = {
   id: string
@@ -13,25 +14,6 @@ type Receipt = {
   page_count: number | null
   preview_url: string | null
   error: string | null
-}
-
-type Extraction = {
-  fields: {
-    merchant: string | null
-    document_date: string | null
-    currency: string | null
-    total: string | null
-    payment_status: 'paid' | 'unpaid' | 'unknown'
-  }
-  validation?: {
-    flags: Array<{
-      field: string
-      code: string
-      severity: 'blocking' | 'warning'
-      reason: string
-      source: { page: number } | null
-    }>
-  }
 }
 
 const statusLabels = { queued: 'Queued', processing: 'Processing', ready: 'Ready', failed: 'Failed' }
@@ -65,7 +47,6 @@ function App() {
   const [listError, setListError] = useState('')
   const [notice, setNotice] = useState('')
   const [selected, setSelected] = useState<Receipt | null>(null)
-  const [extraction, setExtraction] = useState<Extraction | null>(null)
   const [retrying, setRetrying] = useState<string | null>(null)
   const picker = useRef<HTMLInputElement>(null)
   const camera = useRef<HTMLInputElement>(null)
@@ -94,16 +75,6 @@ function App() {
   useEffect(() => {
     if (selected) dialog.current?.showModal()
     else dialog.current?.close()
-  }, [selected])
-
-  useEffect(() => {
-    setExtraction(null)
-    if (!selected) return
-    const controller = new AbortController()
-    void request<Extraction>(`/${selected.id}/extraction`, { signal: controller.signal })
-      .then(result => { if (!controller.signal.aborted) setExtraction(result) })
-      .catch(() => {})
-    return () => controller.abort()
   }, [selected])
 
   function remember(receipt: Receipt) {
@@ -215,6 +186,7 @@ function App() {
                   {receipt.error && <p className="failure">{receipt.error}</p>}
                 </div>
                 <Status status={receipt.status} />
+                {receipt.status === 'ready' && <button type="button" onClick={() => setSelected(receipt)}>Review</button>}
                 {receipt.status === 'failed' && <button className="retry" disabled={retrying !== null} onClick={() => void retry(receipt)}><RotateCw size={14} />{retrying === receipt.id ? 'Retrying…' : 'Retry'}</button>}
               </li>
             )}
@@ -223,27 +195,14 @@ function App() {
         <dialog ref={dialog} onClose={() => setSelected(null)} aria-labelledby="preview-title">
           {selected && <>
             <div className="dialog-title"><h2 id="preview-title">{selected.filename}</h2><button aria-label="Close preview" onClick={() => setSelected(null)}><X size={19} /></button></div>
-            <img className="preview" src={selected.preview_url ?? undefined} alt={`Preview of ${selected.filename}`} />
-            {selected.content_type === 'application/pdf' && <p className="metadata">Page 1 of {selected.page_count}</p>}
-            {extraction && <dl className="extracted">
-              <div><dt>Merchant</dt><dd>{extraction.fields.merchant ?? 'Unknown'}</dd></div>
-              <div><dt>Document date</dt><dd>{extraction.fields.document_date ?? 'Unknown'}</dd></div>
-              <div><dt>Printed total</dt><dd>{extraction.fields.total ?? 'Unknown'} {extraction.fields.currency}</dd></div>
-              <div><dt>Payment status</dt><dd>{extraction.fields.payment_status}</dd></div>
-            </dl>}
-            {extraction?.validation && extraction.validation.flags.length > 0 &&
-              <section className="validation-flags" aria-labelledby="validation-heading">
-                <h3 id="validation-heading">Needs review</h3>
-                <ul>
-                  {extraction.validation.flags.map(flag =>
-                    <li key={`${flag.field}:${flag.code}`}>
-                      <strong>{flag.severity === 'blocking' ? 'Required' : 'Check'}</strong>
-                      {' · '}{flag.reason}{flag.source && ` (page ${flag.source.page})`}
-                    </li>
-                  )}
-                </ul>
-              </section>}
-            <a className="original" href={`/api/receipts/${selected.id}/original`}>Download original</a>
+            <div className="review-layout">
+              <div className="review-document">
+                <img className="preview" src={selected.preview_url ?? undefined} alt={`Preview of ${selected.filename}`} />
+                {selected.content_type === 'application/pdf' && <p className="metadata">Page 1 of {selected.page_count}</p>}
+                <a className="original" href={`/api/receipts/${selected.id}/original`}>Download original</a>
+              </div>
+              <ReviewCard key={selected.id} receiptId={selected.id} />
+            </div>
           </>}
         </dialog>
       </main>

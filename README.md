@@ -1,5 +1,11 @@
 # AI Expense Scanner
 
+## M4 review and confirmation
+
+Select **Review** on a Ready document with a completed extraction. Flagged fields appear first. Select **Edit** to change a field and see a source crop or page when available. Each saved change creates an audit entry and reruns the validation rules. Resolve required flags, then select **Confirm document**. The tracker record keeps the reviewed values and version.
+
+The API exposes `GET /api/receipts/{id}/review`, `PATCH /api/receipts/{id}/fields/{field}`, and `POST /api/receipts/{id}/approve`. Edit and approval requests include the extraction ID and review revision. If another edit changes that version, reload the review. Resubmitting a confirmed version returns the same result.
+
 ## M3 validation and flags
 
 Open a processed document preview to see its review flags. The extraction endpoint also returns a `validation` object with amounts in integer minor units, reconciliation status, flag severity, a reason, and source page or region when available. Reconciliation checks tax-inclusive and tax-exclusive interpretations and allows one minor unit of rounding. Possible duplicate checks are scoped to the local user and compare different uploads, with different explicit supplier invoice numbers treated as separate.
