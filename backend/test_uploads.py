@@ -345,11 +345,36 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(january["expenses"], [])
         self.assertEqual([(row["receipt_id"], row["paid_on"]) for row in december["expenses"]], [(receipt_id, "2025-12-05")])
         self.assertEqual(december["totals"][0]["amount"], "12000.00")
+        review = self.client.get(f"/api/receipts/{receipt_id}/review").json()
+        self.assertIsNone(review["fields"]["payment_date"])
+        self.assertEqual(review["tracker_paid_on"], "2025-12-05")
         with main.Session(main.engine) as session:
             changes = session.scalars(main.select(main.ExpensePaymentChange).order_by(main.ExpensePaymentChange.created_at)).all()
             self.assertEqual([(row.previous_paid_on, row.paid_on, row.prepayment) for row in changes], [
                 (None, date(2024, 1, 15), True), (date(2024, 1, 15), date(2025, 12, 5), False),
             ])
+
+    def test_confirmed_review_retains_original_and_returns_corrected_tracker_date(self):
+        original = "2025-12-02"
+        corrected = "2025-12-03"
+        receipt_id = self.upload_review_fixture(invoice(
+            document_date=original, payment_status="paid", payment_date=original,
+        ))
+        base = f"/api/receipts/{receipt_id}"
+        version = self.client.get(f"{base}/review").json()["version"]
+        approved = self.client.post(f"{base}/approve", json=version)
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(approved.json()["tracker_paid_on"], original)
+
+        response = self.client.patch(f"/api/expenses/{receipt_id}/payment", json={
+            "previous_paid_on": original, "paid_on": corrected,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        review = self.client.get(f"{base}/review").json()
+        self.assertEqual(review["version"], version)
+        self.assertEqual(review["fields"]["payment_date"], original)
+        self.assertEqual(review["tracker_paid_on"], response.json()["paid_on"])
+        self.assertEqual(review["tracker_paid_on"], corrected)
 
     def test_approval_requires_prepayment_confirmation(self):
         receipt_id = self.upload_review_fixture(invoice(

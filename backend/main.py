@@ -22,7 +22,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt, extraction_config
 from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, parse_date, validate_receipt
 from backend.tracker import (
-    CATEGORIES, CategoryRequest, ExpenseReport, PaymentCorrectionRequest, PaymentRequest, TrackerExpense, expense_csv,
+    CATEGORIES, CategoryRequest, ExpenseReport, PaymentCorrectionRequest, PaymentRequest, TrackerExpense, effective_paid_on, expense_csv,
     summarize, tracker_category, tracker_expense, workspace_today,
 )
 
@@ -181,6 +181,7 @@ class ReviewView(BaseModel):
     fields: ReceiptExtraction
     validation: ValidationReport
     confirmed: bool
+    tracker_paid_on: date | None = None
     category: str
     categories: tuple[str, ...] = CATEGORIES
 
@@ -601,6 +602,7 @@ def load_review(session: Session, receipt_id: str) -> tuple[Receipt, Review | No
     return receipt, review, ReviewView(
         version=ReviewVersion(extraction_id=extraction.id, revision=review.revision if review else 0),
         fields=fields, validation=report_with_duplicates(session, saved, receipt), confirmed=expense is not None,
+        tracker_paid_on=effective_paid_on(expense.fields, tracking.paid_on if tracking else None) if expense else None,
         category=(tracking.category if tracking else None) or tracker_category(fields.model_dump()),
     )
 
@@ -683,15 +685,18 @@ def approve_receipt(receipt_id: str, version: ApprovalRequest) -> ReviewView:
         payment_date = current.fields.payment_date
         if current.fields.payment_status == "paid" and payment_date < current.fields.document_date and not version.prepayment:
             raise HTTPException(422, "Confirm that this payment was made before the document date.")
+        snapshot = current.fields.model_dump()
         session.add(Expense(
             receipt_id=receipt_id, extraction_id=version.extraction_id, revision=version.revision,
-            fields=current.fields.model_dump(), currency=currency, amounts_minor=current.validation.amounts_minor,
+            fields=snapshot, currency=currency, amounts_minor=current.validation.amounts_minor,
             confirmed_at=datetime.now(timezone.utc),
         ))
         session.flush()
         session.add(ExpenseTracking(receipt_id=receipt_id, category=category))
         session.commit()
-        return current.model_copy(update={"confirmed": True, "category": category})
+        return current.model_copy(update={
+            "confirmed": True, "category": category, "tracker_paid_on": effective_paid_on(snapshot, None),
+        })
 
 
 @app.get("/api/receipts/{receipt_id}/review/source")

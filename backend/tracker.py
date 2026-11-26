@@ -89,12 +89,17 @@ def amount_text(amount: int, currency: str) -> str:
     return "-" + magnitude if amount < 0 else magnitude
 
 
+def effective_paid_on(fields: dict, paid_on: date | None) -> date | None:
+    if paid_on is None and fields["payment_status"] == "paid":
+        return date.fromisoformat(fields["payment_date"])
+    return paid_on
+
+
 def tracker_expense(
     receipt_id: str, fields: dict, currency: str, amounts_minor: dict[str, int],
     *, paid_on: date | None, category: str | None, today: date,
 ) -> TrackerExpense:
-    if paid_on is None and fields["payment_status"] == "paid":
-        paid_on = date.fromisoformat(fields["payment_date"])
+    paid_on = effective_paid_on(fields, paid_on)
     try:
         due_date = date.fromisoformat(fields["due_date"] or "")
     except ValueError:

@@ -15,6 +15,7 @@ type Review = {
   }
   validation: { flags: Flag[] }
   confirmed: boolean
+  tracker_paid_on: string | null
   category: string
   categories: string[]
 }
@@ -51,26 +52,30 @@ export default function ReviewCard({ receiptId, onProcessingChanged }: { receipt
 
   useEffect(() => {
     const controller = new AbortController()
+    const fetchReview = () => fetch(`${base}/review`, { signal: controller.signal })
     let timer: number | undefined
     let wasProcessing = false
     async function load() {
       try {
-        const response = await fetch(`${base}/review`, { signal: controller.signal })
+        let response = await fetchReview()
         if (response.status === 404) {
           const receipt = await fetch(base, { signal: controller.signal })
           if (!receipt.ok) throw new Error('Could not load the document status.')
           const state: Processing = await receipt.json()
           if (controller.signal.aborted) return
-          setProcessing(state)
-          if (state.status === 'queued' || state.status === 'processing') {
-            wasProcessing = true
-            timer = window.setTimeout(load, 1500)
-          } else if (wasProcessing) {
-            wasProcessing = false
-            onProcessingChanged()
-            if (state.status === 'ready') timer = window.setTimeout(load, 0)
+          if (state.status === 'ready') response = await fetchReview()
+          if (controller.signal.aborted) return
+          if (response.status === 404) {
+            setProcessing(state)
+            if (state.status === 'queued' || state.status === 'processing') {
+              wasProcessing = true
+              timer = window.setTimeout(load, 1500)
+            } else if (wasProcessing) {
+              wasProcessing = false
+              onProcessingChanged()
+            }
+            return
           }
-          return
         }
         if (!response.ok) throw new Error('Could not load the review.')
         const next = await response.json()
@@ -165,6 +170,7 @@ export default function ReviewCard({ receiptId, onProcessingChanged }: { receipt
   const flags = review.validation.flags
   const { payment_status, payment_date, document_date } = review.fields
   const needsPrepayment = Boolean(payment_status === 'paid' && payment_date && document_date && payment_date < document_date)
+  const showTrackerDate = review.confirmed && review.tracker_paid_on && review.tracker_paid_on !== payment_date
   const rows = [
     ...Object.entries(labels).map(([field, label]) => ({ field, label, value: review.fields[field] })),
     ...review.fields.line_items.flatMap((item, index) => Object.entries(lineLabels).map(([key, label]) => ({
@@ -185,9 +191,13 @@ export default function ReviewCard({ receiptId, onProcessingChanged }: { receipt
       {rows.sort((a, b) => priority(a.field) - priority(b.field)).map(({ field, label, value }) => (
         <div className="review-row" key={field}>
           <div className="review-row-value">
-            <strong>{label}</strong>
+            <strong>{review.confirmed && (field === 'payment_date' || field === 'payment_status') ? `${label} at confirmation` : label}</strong>
             <span>{value ?? '—'}</span>
           </div>
+          {field === 'payment_date' && showTrackerDate && <div className="review-row-value review-tracker-date">
+            <strong>Tracker payment date</strong>
+            <span>{review.tracker_paid_on}</span>
+          </div>}
           {flags.filter(flag => flag.field === field).map(flag =>
             <p className="review-flag" key={flag.code}>{flag.severity === 'blocking' ? 'Required · ' : ''}{flag.reason}</p>,
           )}

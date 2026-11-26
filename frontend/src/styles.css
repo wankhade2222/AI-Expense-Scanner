@@ -68,6 +68,7 @@ dialog::backdrop { background: #0e211dc0; }
 .review-row { padding: 10px 0; border-bottom: 1px solid #e4ece8; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px 10px; }
 .review-row-value { display: flex; flex-wrap: wrap; gap: 4px 10px; overflow-wrap: anywhere; }
 .review-row > button { grid-column: 2; grid-row: 1; }
+.review-tracker-date { grid-column: 1 / -1; }
 .review-flag, .review-edit { grid-column: 1 / -1; }
 .review-flag, .review-error { padding: 8px 10px; background: #fff5df; color: #64450d; border-radius: 7px; }
 .review-edit { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
