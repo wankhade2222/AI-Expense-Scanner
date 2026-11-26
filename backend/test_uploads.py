@@ -11,14 +11,16 @@ from PIL import Image
 from sqlalchemy import create_engine
 
 from backend import main
-from backend.extraction import ExtractionResult
+from backend.extraction import GEMINI_MODEL, ExtractionResult
 from backend.extraction_samples import SAMPLES, render_sample
 from backend.test_validation import invoice
 
 
 class UploadTests(unittest.TestCase):
     def setUp(self):
-        self.enterContext(patch.dict(os.environ, {"OPENAI_API_KEY": ""}))
+        self.enterContext(patch.dict(os.environ, {
+            "EXTRACTION_PROVIDER": "", "GEMINI_API_KEY": "", "GEMINI_MODEL": "", "OPENAI_API_KEY": "",
+        }))
         directory = self.enterContext(TemporaryDirectory())
         database = create_engine(f"sqlite:///{(Path(directory) / 'test.db').as_posix()}")
         self.addCleanup(database.dispose)
@@ -71,26 +73,52 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/receipts").json(), [])
 
     def test_labelled_samples_through_structured_extraction(self):
+        self.check_labelled_samples("openai")
+
+    def test_labelled_samples_through_gemini(self):
+        self.check_labelled_samples("gemini")
+
+    def check_labelled_samples(self, provider):
         import httpx
 
         def respond(url, *, json, headers, timeout):
-            images = [part for part in json["input"][0]["content"] if part["type"] == "input_image"]
-            self.assertEqual(len(images), sample.pages)
-            self.assertTrue(json["text"]["format"]["strict"])
             payload = {name: None for name in main.ReceiptExtraction.model_fields}
             payload.update(
                 merchant=sample.merchant, document_date=sample.document_date, currency=sample.currency,
                 total=sample.total, payment_status=sample.payment_status, due_date=sample.due_date,
                 document_type=sample.document_type, line_items=[], sources=[],
             )
-            return httpx.Response(
-                200, request=httpx.Request("POST", url),
-                json={"status": "completed", "model": "fixture-model", "output": [{
+            if provider == "gemini":
+                self.assertEqual(url, f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent")
+                self.assertEqual(headers, {"x-goog-api-key": "test-only"})
+                config = json["generationConfig"]
+                self.assertEqual(config["responseMimeType"], "application/json")
+                self.assertEqual(config["responseJsonSchema"], main.ReceiptExtraction.model_json_schema())
+                parts = json["contents"][0]["parts"]
+                images = [part["inlineData"] for part in parts if "inlineData" in part]
+                self.assertEqual(len(images), sample.pages)
+                self.assertTrue(all(image["mimeType"] == "image/jpeg" and image["data"] for image in images))
+                self.assertEqual([part["text"] for part in parts[1::2]], [
+                    f"Page {number}" for number in range(1, sample.pages + 1)
+                ])
+                reply = {"modelVersion": "fixture-model", "candidates": [{
+                    "finishReason": "STOP", "content": {"parts": [
+                        {"thought": True, "text": "Internal thought"},
+                        {"text": dumps(payload)},
+                    ]},
+                }]}
+            else:
+                images = [part for part in json["input"][0]["content"] if part["type"] == "input_image"]
+                self.assertEqual(len(images), sample.pages)
+                self.assertTrue(json["text"]["format"]["strict"])
+                reply = {"status": "completed", "model": "fixture-model", "output": [{
                     "type": "message", "content": [{"type": "output_text", "text": dumps(payload)}],
-                }]},
-            )
+                }]}
+            return httpx.Response(200, request=httpx.Request("POST", url), json=reply)
 
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}), patch("backend.extraction.httpx.post", respond):
+        with patch.dict(os.environ, {f"{provider.upper()}_API_KEY": "test-only"}), patch(
+            "backend.extraction.httpx.post", respond,
+        ):
             for sample in SAMPLES:
                 with self.subTest(merchant=sample.merchant):
                     content, content_type = render_sample(sample)
@@ -102,6 +130,23 @@ class UploadTests(unittest.TestCase):
                     self.assertEqual(extraction["model"], "fixture-model")
                     for name in ("merchant", "total", "document_date", "currency", "payment_status", "due_date"):
                         self.assertEqual(extraction["fields"][name], getattr(sample, name))
+
+    def test_gemini_quota_failure_keeps_preview_and_allows_retry(self):
+        import httpx
+
+        with patch.dict(os.environ, {"EXTRACTION_PROVIDER": "gemini", "GEMINI_API_KEY": "test-only"}), patch(
+            "backend.extraction.httpx.post", side_effect=lambda url, **kwargs: httpx.Response(
+                429, request=httpx.Request("POST", url),
+            ),
+        ) as request:
+            upload = self.upload("quota.jpg", render_sample(SAMPLES[0])[0])
+            path = f"/api/receipts/{upload.json()['id']}"
+            failed = self.client.get(path).json()
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("usage limit", failed["error"])
+            self.assertEqual(self.client.get(failed["preview_url"]).status_code, 200)
+            self.assertEqual(self.client.post(f"{path}/retry").status_code, 202)
+            self.assertEqual(request.call_count, 2)
 
     def test_invalid_model_output_can_be_retried_without_reupload(self):
         import httpx

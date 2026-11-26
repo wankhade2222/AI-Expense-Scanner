@@ -19,7 +19,7 @@ from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, cas
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
-from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt
+from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt, extraction_config
 from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, validate_receipt
 
 logger = logging.getLogger(__name__)
@@ -284,10 +284,10 @@ def process_receipt(receipt_id: str, attempt: str) -> None:
         original = load(storage_key)
         preview, count = prepare_preview(original, content_type)
         store(preview_key(receipt_id, attempt), preview, "image/jpeg")
-        if api_key := os.getenv("OPENAI_API_KEY"):
+        if config := extraction_config():
             extracted = extract_receipt(
-                extraction_pages(original, content_type), api_key=api_key,
-                model=os.getenv("OPENAI_MODEL") or "gpt-4.1-mini",
+                extraction_pages(original, content_type), api_key=config.api_key,
+                model=config.model, provider=config.provider,
             )
         result = {"status": "ready", "page_count": count, "error": None}
     except ExtractionError as exc:
@@ -502,8 +502,12 @@ def retry(receipt_id: str, tasks: BackgroundTasks) -> ReceiptView:
 
 @app.post("/api/receipts/{receipt_id}/extract", status_code=status.HTTP_202_ACCEPTED)
 def extract_again(receipt_id: str, tasks: BackgroundTasks) -> ReceiptView:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(503, "Set OPENAI_API_KEY to enable extraction.")
+    try:
+        config = extraction_config()
+    except ExtractionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    if config is None:
+        raise HTTPException(503, "Set the API key for the selected extraction provider.")
     return queue_again(receipt_id, tasks, "ready")
 
 

@@ -1,12 +1,12 @@
 """Run the M2 extraction baseline on synthetic documents, with real API calls."""
 
+import argparse
 import io
-import os
 from dataclasses import dataclass
 
 from PIL import Image, ImageDraw, ImageFont
 
-from backend.extraction import ExtractionError, extract_receipt
+from backend.extraction import ExtractionError, extract_receipt, extraction_config
 from backend.main import extraction_pages
 
 
@@ -77,21 +77,31 @@ def render_sample(sample: Sample) -> tuple[bytes, str]:
 
 
 def main() -> None:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise SystemExit("Set OPENAI_API_KEY to run the live sample baseline.")
-    model = os.getenv("OPENAI_MODEL") or "gpt-4.1-mini"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--limit", type=int, choices=range(1, len(SAMPLES) + 1), default=len(SAMPLES))
+    settings = parser.parse_args()
+    try:
+        config = extraction_config()
+    except ExtractionError as exc:
+        raise SystemExit(str(exc)) from exc
+    if config is None:
+        raise SystemExit("Set GEMINI_API_KEY or OPENAI_API_KEY to run the live sample baseline.")
+    selected = SAMPLES[:settings.limit]
+    print(f"Running {len(selected)} samples with {config.provider} / {config.model}.", flush=True)
     mismatches = 0
-    for sample in SAMPLES:
+    for sample in selected:
         try:
-            fields = extract_receipt(extraction_pages(*render_sample(sample)), api_key=key, model=model).fields
+            fields = extract_receipt(
+                extraction_pages(*render_sample(sample)), api_key=config.api_key, model=config.model,
+                provider=config.provider,
+            ).fields
         except ExtractionError as exc:
             raise SystemExit(f"{sample.merchant}: {exc}") from exc
         names = ("merchant", "document_type", "document_date", "currency", "total", "payment_status", "due_date")
         differences = [name for name in names if getattr(fields, name) != getattr(sample, name)]
         mismatches += bool(differences)
         print(f"{sample.merchant}: " + (", ".join(differences) if differences else "matched"))
-    print(f"{len(SAMPLES) - mismatches}/{len(SAMPLES)} documents matched all labelled fields.")
+    print(f"{len(selected) - mismatches}/{len(selected)} documents matched all labelled fields.")
     raise SystemExit(bool(mismatches))
 
 

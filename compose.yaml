@@ -4,6 +4,9 @@ x-backend: &backend
     dockerfile: backend/Dockerfile
   environment:
     PYTHONPATH: /app
+    EXTRACTION_PROVIDER: ${EXTRACTION_PROVIDER:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
     DATABASE_URL: postgresql+psycopg://scanner:scanner@db/scanner

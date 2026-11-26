@@ -18,11 +18,13 @@ Run the validation and API tests from the project root:
 
 ## M2 structured extraction
 
-Set `OPENAI_API_KEY` in the API process environment for local Python, or place it in the ignored `.env` file for Docker Compose. Restart the API and worker after changing configuration. `OPENAI_MODEL` defaults to `gpt-4.1-mini`. Without a key, uploads still produce previews.
+To use Gemini in Docker Compose, copy `.env.example` to `.env` if needed and add `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/api-keys). The example selects `EXTRACTION_PROVIDER=gemini` and `GEMINI_MODEL=gemini-3.8-flash`. Run `docker compose up --build -d` to apply the settings. For local Python, set the same variables in the API process environment.
 
-With extraction enabled, all pages of each new document go to OpenAI. Use synthetic or redacted samples. The API stores typed fields and the raw response with the model and prompt version. Read the most recent successful result at `GET /api/receipts/{id}/extraction`. Use `POST /api/receipts/{id}/extract` on an existing Ready document to run extraction or create a new version.
+Set `EXTRACTION_PROVIDER=openai` and `OPENAI_API_KEY` to use OpenAI. Its default model is `gpt-4.1-mini`. With no explicit provider, the worker uses Gemini when a Gemini key is present and otherwise checks for an OpenAI key. Without a key for the selected provider, uploads still produce previews.
 
-To compare live model output against 20 labelled synthetic receipts and invoices, set the key in your shell and run `./.venv/Scripts/python.exe -m backend.extraction_samples`. This makes 20 billable API requests on a complete run. The regular unit tests use mocked provider responses.
+With extraction enabled, all document pages go to the selected provider. Use synthetic or redacted documents when testing on the free tier. Both providers use the same receipt schema. The API stores typed fields and the raw response with the model and prompt version. Read the most recent successful result at `GET /api/receipts/{id}/extraction`. Use `POST /api/receipts/{id}/extract` on an existing Ready document to run extraction or create a new version.
+
+Run `docker compose exec api python -m backend.extraction_samples` to compare live output against 20 labelled synthetic receipts and invoices. For local Python, set the provider variables in your shell and run `./.venv/Scripts/python.exe -m backend.extraction_samples`. Start with `--limit 1` for a smoke test. A full run makes up to 20 provider calls and counts toward the provider quota. Automated tests mock the provider responses.
 
 A receipt and supplier invoice scanner for solo freelancers. M1 covers upload, private file storage, previews, status, duplicate detection, and retry.
 
