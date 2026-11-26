@@ -1,0 +1,37 @@
+# AI Expense Scanner
+
+A receipt and supplier invoice scanner for solo freelancers. M1 covers upload, private file storage, previews, status, duplicate detection, and retry.
+
+## Local development
+
+Install Python 3.12 or 3.13 and Node.js 22.12 or newer. Run the following from the repository root in PowerShell.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
+```
+
+In a second terminal:
+
+```powershell
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run dev
+```
+
+Open the Local URL Vite prints. By default the API uses SQLite, local files under `.data/`, and in-process background preview jobs. M1 uses a single local identity. Keep the API and UI on loopback until real authentication is implemented.
+
+## PostgreSQL and Redis worker
+
+With Docker running, use `docker compose up --build` in place of the Python server command. This starts PostgreSQL, Redis, the API, and the RQ worker. Start Vite separately using the same frontend commands.
+
+Compose defaults to a shared file volume. To use a private AWS S3 bucket, copy `.env.example` to `.env`, fill in the bucket and AWS region, and provide AWS credentials through the shell or your local secret workflow. The API and worker both need object access. Use synthetic documents in development.
+
+## Verify M1
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest backend.test_uploads
+npm.cmd --prefix frontend run build
+```
+
+Upload a photo and a multi-page PDF. Check that they become Ready, open their thumbnails, and confirm that the PDF displays its page count and lets you download the original. Upload the exact same PDF again and verify the list still has one copy of it. For a failure-path check, upload a file with a PDF header and invalid contents. It should show Failed and offer Retry from the stored original.

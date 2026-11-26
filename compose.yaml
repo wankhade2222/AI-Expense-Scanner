@@ -1,0 +1,60 @@
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  environment:
+    PYTHONPATH: /app
+    DATABASE_URL: postgresql+psycopg://scanner:scanner@db/scanner
+    REDIS_URL: redis://redis:6379/0
+    DATA_DIR: /data
+    S3_BUCKET: ${S3_BUCKET:-}
+    S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+  volumes:
+    - files:/data
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  api:
+    <<: *backend
+    command: uvicorn backend.main:app --host 0.0.0.0
+    ports:
+      - "127.0.0.1:8000:8000"
+  worker:
+    <<: *backend
+    command: rq worker --url redis://redis:6379/0 receipts
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: scanner
+      POSTGRES_USER: scanner
+      POSTGRES_PASSWORD: scanner
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner -d scanner"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - queue:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  database:
+  files:
+  queue:
