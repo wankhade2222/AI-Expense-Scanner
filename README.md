@@ -1,5 +1,13 @@
 # AI Expense Scanner
 
+## M6 extraction evaluation
+
+Run `./.venv/Scripts/python.exe -m backend.evaluation --output .data/evaluation-fixture.json` to exercise the scoring and validation rules offline. The 23 synthetic cases reuse the M2 receipts and invoices and add a tax-inclusive receipt, an obscured total, and a deliberately wrong fixture response. The offline report measures the test fixtures.
+
+With a provider key configured, run `docker compose exec api python -m backend.evaluation --live --output /data/evaluation-live.json` for model results. Add `--limit 3` for a quick check. Each document makes a provider call, and temporary failures are retried once. Failed requests are reported separately from field accuracy. The report records the dataset, requested and returned model versions, prompt version, validation rules, and the evaluation date.
+
+The summary reports field accuracy, **missed errors** (wrong values without a flag), **extra flags** (correct values that did not require review), and **missed review** (correct values that still needed user input). The detailed JSON includes field values and flag codes for each document. Use `--compare path/to/previous.json` to see changes on successfully scored documents shared by both runs. Comparisons require the same dataset and validation date. Use `--resume /data/evaluation-live.json` with the same live provider and settings to retry only the remaining cases after a quota limit. The harness runs document-level validators and uses generated documents without database history.
+
 ## M5 bills and spending
 
 Choose a suggested category in Review, or change the category later in either tracker view. **Bills to pay** lists confirmed unpaid documents, with overdue bills and missing due dates marked. **Mark as paid** records the full payment on the date entered and moves the bill to the corresponding **Monthly spending** view. Monthly totals are grouped by currency and category. **Export CSV** uses the filters currently selected on the tracker.
