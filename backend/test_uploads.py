@@ -89,6 +89,10 @@ class UploadTests(unittest.TestCase):
                 document_type=sample.document_type, line_items=[], sources=[],
             )
             if provider == "gemini":
+                payload["sources"] = [
+                    {"field": "total", "page": sample.pages, "box": [100, 200, 400, 500]},
+                    {"field": "merchant", "page": 1, "box": [0.1, 0.2, 0.4, 0.5]},
+                ]
                 self.assertEqual(url, f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent")
                 self.assertEqual(headers, {"x-goog-api-key": "test-only"})
                 config = json["generationConfig"]
@@ -128,6 +132,10 @@ class UploadTests(unittest.TestCase):
                     self.assertEqual(self.client.get(path).json()["status"], "ready")
                     extraction = self.client.get(f"{path}/extraction").json()
                     self.assertEqual(extraction["model"], "fixture-model")
+                    if provider == "gemini":
+                        total_source, merchant_source = extraction["fields"]["sources"]
+                        self.assertEqual(total_source, {"field": "total", "page": sample.pages, "box": None})
+                        self.assertEqual(merchant_source["box"], [0.1, 0.2, 0.4, 0.5])
                     for name in ("merchant", "total", "document_date", "currency", "payment_status", "due_date"):
                         self.assertEqual(extraction["fields"][name], getattr(sample, name))
 

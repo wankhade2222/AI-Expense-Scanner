@@ -1,5 +1,6 @@
 from base64 import b64encode
 from dataclasses import dataclass, field
+import json
 import os
 import re
 from time import monotonic
@@ -9,7 +10,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 PROMPT_VERSION = "receipt-v1"
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 OPENAI_MODEL = "gpt-4.1-mini"
 Provider = Literal["gemini", "openai"]
 PROMPT = """Extract one business receipt or supplier invoice from these ordered page images.
@@ -176,7 +177,18 @@ def extract_receipt(
     try:
         request = request_gemini if provider == "gemini" else request_openai
         text, raw, actual_model = request(pages, api_key, model)
-        fields = ReceiptExtraction.model_validate_json(text)
+        if provider == "gemini":
+            data = json.loads(text)
+            # Keep valid page evidence when Gemini proposes an unusable crop.
+            for source in data.get("sources", []):
+                if isinstance(source, dict) and source.get("box") is not None:
+                    try:
+                        Source.model_validate(source)
+                    except ValidationError:
+                        source["box"] = None
+            fields = ReceiptExtraction.model_validate(data)
+        else:
+            fields = ReceiptExtraction.model_validate_json(text)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in (401, 403):
             raise ExtractionError("Extraction access was denied. Check the API key and model access.") from exc

@@ -18,7 +18,7 @@ Run the validation and API tests from the project root:
 
 ## M2 structured extraction
 
-To use Gemini in Docker Compose, copy `.env.example` to `.env` if needed and add `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/api-keys). The example selects `EXTRACTION_PROVIDER=gemini` and `GEMINI_MODEL=gemini-3.8-flash`. Run `docker compose up --build -d` to apply the settings. For local Python, set the same variables in the API process environment.
+To use Gemini in Docker Compose, copy `.env.example` to `.env` if needed and add `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/api-keys). The example selects `EXTRACTION_PROVIDER=gemini` and `GEMINI_MODEL=gemini-3.1-flash-lite`. Run `docker compose up --build -d` to apply the settings. For local Python, set the same variables in the API process environment.
 
 Set `EXTRACTION_PROVIDER=openai` and `OPENAI_API_KEY` to use OpenAI. Its default model is `gpt-4.1-mini`. With no explicit provider, the worker uses Gemini when a Gemini key is present and otherwise checks for an OpenAI key. Without a key for the selected provider, uploads still produce previews.
 
