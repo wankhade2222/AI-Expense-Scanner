@@ -3,10 +3,12 @@
 import argparse
 import hashlib
 import json
+import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from time import sleep
 import unicodedata
@@ -63,9 +65,24 @@ CASES = tuple(Case(sample) for sample in SAMPLES) + (
     Case(Sample("Poppy Office", "2026-09-23", "INR", "118.00", "paid", subtotal="100.00", tax="18.00"),
          {"total": "130.00", "merchant": "Poppy Supply"}),
 )
-DATASET_VERSION = "synthetic-receipts-v1-" + hashlib.sha256(
-    json.dumps([asdict(case) for case in CASES], sort_keys=True).encode(),
-).hexdigest()[:12]
+
+
+def dataset_fingerprint(cases: tuple[Case, ...], images: dict[str, list[bytes]]) -> str:
+    manifest = [{
+        "definition": asdict(case),
+        "labels": case.labels(),
+        "expected_review": sorted(case.expected_review()),
+        "page_hashes": [hashlib.sha256(page).hexdigest() for page in images[case.case_id]],
+    } for case in cases]
+    fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    return "synthetic-receipts-v2-" + fingerprint
+
+
+@lru_cache(maxsize=1)
+def rendered_dataset() -> tuple[str, dict[str, list[bytes]]]:
+    # Hash the exact JPEG inputs. PDF container metadata can vary even when rendered pages are identical.
+    images = {case.case_id: extraction_pages(*render_sample(case.sample)) for case in CASES}
+    return dataset_fingerprint(CASES, images), images
 
 
 def fixture_fields(case: Case) -> ReceiptExtraction:
@@ -153,12 +170,15 @@ def failure_details(error: ExtractionError) -> dict:
     return details
 
 
-def evaluate(case: Case, config: ExtractionConfig | None, validation_date: date) -> dict:
+def evaluate(
+    case: Case, config: ExtractionConfig | None, validation_date: date, *, pages: list[bytes] | None = None,
+) -> dict:
     result = {"id": case.case_id, "merchant": case.sample.merchant}
     if config is None:
         fields, model = fixture_fields(case), "fixture-v1"
     else:
-        pages = extraction_pages(*render_sample(case.sample))
+        if pages is None:
+            pages = extraction_pages(*render_sample(case.sample))
         for attempt in (1, 2):
             try:
                 extraction = extract_receipt(pages, api_key=config.api_key, model=config.model, provider=config.provider)
@@ -178,7 +198,7 @@ def evaluate(case: Case, config: ExtractionConfig | None, validation_date: date)
 
 def build_report(cases: list[dict], config: ExtractionConfig | None, validation_date: date) -> dict:
     return {
-        "report_version": REPORT_VERSION, "dataset_version": DATASET_VERSION,
+        "report_version": REPORT_VERSION, "dataset_version": rendered_dataset()[0],
         "generated_at": datetime.now(timezone.utc).isoformat(), "validation_date": validation_date.isoformat(),
         "provider": config.provider if config else "fixture",
         "requested_model": config.model if config else "fixture-v1",
@@ -258,10 +278,11 @@ def main() -> int:
             parser.error(f"Could not resume the report. {exc}")
     selected = CASES[:args.limit]
     pending = [case for case in selected if case.case_id not in scored]
+    _, images = rendered_dataset()
     if args.resume:
         print(f"Reusing {len(selected) - len(pending)} scored documents. Evaluating {len(pending)} remaining.")
     with ThreadPoolExecutor(max_workers=2 if args.live else 1) as executor:
-        for result in executor.map(lambda case: evaluate(case, config, args.as_of), pending):
+        for result in executor.map(lambda case: evaluate(case, config, args.as_of, pages=images[case.case_id]), pending):
             scored[result["id"]] = result
             if args.live:
                 quota = ", ".join(result.get("quota_ids", []))
@@ -272,12 +293,15 @@ def main() -> int:
     if args.compare:
         try:
             report["comparison"] = compare_reports(report, json.loads(args.compare.read_text(encoding="utf-8")))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            parser.error(f"Could not compare reports. {exc}")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            report["comparison_error"] = f"Could not compare reports. {exc}"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print_report(report)
+    if comparison_error := report.get("comparison_error"):
+        print(comparison_error, file=sys.stderr)
+        return 2
     return int(report["coverage"]["scored"] < report["coverage"]["requested"])
 
 
