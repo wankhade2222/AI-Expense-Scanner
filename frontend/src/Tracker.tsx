@@ -14,15 +14,17 @@ type Expense = {
   overdue: boolean
 }
 type Total = { currency: string; amount: string; category: string | null }
-type Report = { expenses: Expense[]; totals: Total[]; category_totals: Total[]; categories: string[] }
+type Report = {
+  expenses: Expense[]; totals: Total[]; category_totals: Total[]; categories: string[]
+  today: string; month: string | null; next_day_at: string
+}
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeZone: 'UTC' })
 const formatDate = (value: string) => dateFormat.format(new Date(value + 'T00:00:00Z'))
-const today = () => new Date().toISOString().slice(0, 10)
 
 export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
   const unpaid = mode === 'bills'
-  const [month, setMonth] = useState(() => today().slice(0, 7))
+  const [month, setMonth] = useState('')
   const [category, setCategory] = useState('')
   const [report, setReport] = useState<Report | null>(null)
   const [loadedQuery, setLoadedQuery] = useState('')
@@ -32,13 +34,16 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
   const [notice, setNotice] = useState('')
   const [paymentFor, setPaymentFor] = useState<string | null>(null)
   const [paidOn, setPaidOn] = useState('')
+  const [prepayment, setPrepayment] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
   const params = new URLSearchParams({ status: unpaid ? 'unpaid' : 'paid' })
-  if (!unpaid && month) params.set('month', month)
+  if (!unpaid) params.set('month', month || 'current')
   if (category) params.set('category', category)
   const query = params.toString()
   const requestKey = `${query}&reload=${reload}`
   const loading = loadedQuery !== requestKey
+  const exportParams = new URLSearchParams(query)
+  if (!unpaid && !loading && report?.month) exportParams.set('month', report.month)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -64,6 +69,14 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
     return () => controller.abort()
   }, [query, requestKey])
 
+  useEffect(() => {
+    if (loading || !report) return
+    const wait = Date.parse(report.next_day_at) - Date.now()
+    if (!(wait > 0)) return
+    const timer = window.setTimeout(() => setReload(value => value + 1), wait + 100)
+    return () => window.clearTimeout(timer)
+  }, [report, loading])
+
   async function update(expense: Expense, action: string, method: string, body: object) {
     if (busy) return
     setBusy(expense.receipt_id)
@@ -77,9 +90,9 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
         const payload = await response.json().catch(() => null)
         throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Could not update the expense.')
       }
-      if (action === 'mark-paid') {
+      if (action === 'mark-paid' || action === 'payment') {
         setPaymentFor(null)
-        setNotice(`Payment recorded for ${expense.merchant} on ${formatDate(paidOn)}.`)
+        setNotice(`Payment date for ${expense.merchant} saved as ${formatDate(paidOn)}.`)
       }
       setReload(value => value + 1)
     } catch (problem) {
@@ -95,11 +108,12 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
         <h1>{unpaid ? 'Bills to pay' : 'Monthly spending'}</h1>
         <p>{unpaid ? 'Outstanding business bills and their due dates.' : 'Confirmed payments grouped by payment month and currency.'}</p>
       </div>
-      <a className="tracker-export" href={`/api/expenses/export.csv?${query}`}><Download size={17} /> Export CSV</a>
+      {!loading && report && <a className="tracker-export" href={`/api/expenses/export.csv?${exportParams}`}><Download size={17} /> Export CSV</a>}
     </header>
     <div className="tracker-filters">
-      {!unpaid && <label>Payment month<input type="month" value={month} onChange={event => {
-        setMonth(event.target.value || today().slice(0, 7))
+      {!unpaid && <label>Payment month<input type="month" value={month || report?.month || ''} onChange={event => {
+        setMonth(event.target.value)
+        setPaymentFor(null)
         setError('')
       }} /></label>}
       <label>Category<select value={category} onChange={event => {
@@ -149,18 +163,31 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
                 onChange={event => void update(expense, 'category', 'PATCH', { category: event.target.value })}>
                 {categories.map(name => <option key={name}>{name}</option>)}
               </select>
-              {unpaid && <button type="button" disabled={busy !== null} onClick={() => {
+              <button type="button" disabled={busy !== null} onClick={() => {
                 setPaymentFor(expense.receipt_id)
-                setPaidOn(today())
+                setPaidOn(expense.paid_on ?? report.today)
+                setPrepayment(false)
                 setError('')
-              }}>Mark as paid</button>}
+              }}>{unpaid ? 'Mark as paid' : 'Edit payment date'}</button>
               {paymentFor === expense.receipt_id && <form className="payment-form" onSubmit={event => {
                 event.preventDefault()
-                void update(expense, 'mark-paid', 'POST', { paid_on: paidOn })
+                const body = { paid_on: paidOn, prepayment }
+                if (expense.paid_on) {
+                  void update(expense, 'payment', 'PATCH', { ...body, previous_paid_on: expense.paid_on })
+                } else {
+                  void update(expense, 'mark-paid', 'POST', body)
+                }
               }}>
-                <label>Payment date<input type="date" value={paidOn} max={today()} required
-                  onChange={event => setPaidOn(event.target.value)} /></label>
-                <button className="primary" disabled={busy !== null}>Record payment</button>
+                <label>Payment date<input type="date" value={paidOn} max={report.today} required
+                  onChange={event => {
+                    setPaidOn(event.target.value)
+                    setPrepayment(false)
+                  }} /></label>
+                {paidOn && paidOn < expense.document_date && paidOn !== expense.paid_on && <label className="prepayment-check">
+                  <input type="checkbox" checked={prepayment} onChange={event => setPrepayment(event.target.checked)} required />
+                  This payment was made before the document date.
+                </label>}
+                <button className="primary" disabled={busy !== null}>{unpaid ? 'Record payment' : 'Save payment date'}</button>
                 <button type="button" disabled={busy !== null} onClick={() => setPaymentFor(null)}>Cancel</button>
               </form>}
             </li>)}

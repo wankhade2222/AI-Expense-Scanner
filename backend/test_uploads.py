@@ -2,6 +2,7 @@ import io
 import os
 import unittest
 from csv import DictReader
+from datetime import date, datetime, timezone
 from json import dumps
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,7 @@ from backend import main
 from backend.extraction import GEMINI_MODEL, ExtractionResult
 from backend.extraction_samples import SAMPLES, render_sample
 from backend.test_validation import invoice
+from backend.tracker import workspace_today
 
 
 class UploadTests(unittest.TestCase):
@@ -315,3 +317,91 @@ class UploadTests(unittest.TestCase):
         self.assertEqual((rows[0]["Merchant"], rows[0]["Currency"], rows[0]["Paid on"]),
                          ("'=1+1", "USD", "2025-12-02"))
         self.assertEqual((rows[0]["Subtotal"], rows[0]["Rounding"]), ("30.01", "-0.01"))
+
+    def test_payment_correction_moves_month_and_prepayments_require_confirmation(self):
+        fields = invoice(document_date="2025-12-02", subtotal=None, tax=None, total="12000")
+        receipt_id = self.upload_review_fixture(fields)
+        base = f"/api/expenses/{receipt_id}"
+        version = self.client.get(f"/api/receipts/{receipt_id}/review").json()["version"]
+        self.assertEqual(self.client.post(f"/api/receipts/{receipt_id}/approve", json=version).status_code, 200)
+
+        prepayment = {"paid_on": "2024-01-15"}
+        self.assertEqual(self.client.post(f"{base}/mark-paid", json=prepayment).status_code, 422)
+        prepayment["prepayment"] = True
+        self.assertEqual(self.client.post(f"{base}/mark-paid", json=prepayment).status_code, 200)
+        self.assertEqual(len(self.client.get("/api/expenses?month=2024-01").json()["expenses"]), 1)
+        correction = {"previous_paid_on": "2024-01-15", "paid_on": "2025-12-05"}
+        for _ in range(2):
+            self.assertEqual(self.client.patch(f"{base}/payment", json=correction).status_code, 200)
+        self.assertEqual(self.client.patch(f"{base}/payment", json={
+            **correction, "paid_on": "2025-12-06",
+        }).status_code, 409)
+        self.assertEqual(self.client.patch(f"{base}/payment", json={
+            "previous_paid_on": "2025-12-05", "paid_on": "2025-11-30",
+        }).status_code, 422)
+
+        january = self.client.get("/api/expenses?month=2024-01").json()
+        december = self.client.get("/api/expenses?month=2025-12").json()
+        self.assertEqual(january["expenses"], [])
+        self.assertEqual([(row["receipt_id"], row["paid_on"]) for row in december["expenses"]], [(receipt_id, "2025-12-05")])
+        self.assertEqual(december["totals"][0]["amount"], "12000.00")
+        with main.Session(main.engine) as session:
+            changes = session.scalars(main.select(main.ExpensePaymentChange).order_by(main.ExpensePaymentChange.created_at)).all()
+            self.assertEqual([(row.previous_paid_on, row.paid_on, row.prepayment) for row in changes], [
+                (None, date(2024, 1, 15), True), (date(2024, 1, 15), date(2025, 12, 5), False),
+            ])
+
+    def test_approval_requires_prepayment_confirmation(self):
+        receipt_id = self.upload_review_fixture(invoice(
+            document_date="2025-12-02", payment_status="paid", payment_date="2025-12-01",
+        ))
+        base = f"/api/receipts/{receipt_id}"
+        version = self.client.get(f"{base}/review").json()["version"]
+        self.assertEqual(self.client.post(f"{base}/approve", json=version).status_code, 422)
+        self.assertEqual(self.client.post(f"{base}/approve", json={**version, "prepayment": True}).status_code, 200)
+
+    def test_workspace_calendar_applies_to_reporting_overdue_and_payments(self):
+        from zoneinfo import ZoneInfo
+
+        with patch("backend.tracker.WORKSPACE_TIMEZONE", ZoneInfo("Asia/Kolkata")):
+            self.assertEqual(workspace_today(datetime(2026, 11, 25, 19, tzinfo=timezone.utc)), date(2026, 11, 26))
+            local_today = workspace_today(datetime(2026, 11, 30, 19, tzinfo=timezone.utc))
+        self.assertEqual(local_today, date(2026, 12, 1))
+        receipt_id = self.upload_review_fixture(invoice(document_date="2025-11-26", due_date="2026-11-30"))
+        route = f"/api/receipts/{receipt_id}"
+        review = self.client.get(f"{route}/review").json()
+        self.assertEqual(self.client.post(f"{route}/approve", json=review["version"]).status_code, 200)
+        with patch.object(main, "workspace_today", return_value=local_today):
+            bills = self.client.get("/api/expenses?status=unpaid").json()
+            self.assertTrue(bills["expenses"][0]["overdue"])
+            self.assertEqual(bills["today"], "2026-12-01")
+            response = self.client.post(f"/api/expenses/{receipt_id}/mark-paid", json={"paid_on": "2026-12-01"})
+            self.assertEqual(response.status_code, 200, response.text)
+            current = self.client.get("/api/expenses?month=current").json()
+            self.assertEqual(current["month"], "2026-12")
+            self.assertEqual(len(current["expenses"]), 1)
+            export = self.client.get("/api/expenses/export.csv?month=current")
+            self.assertEqual(len(list(DictReader(io.StringIO(export.text)))), 1)
+
+    def test_preview_only_upload_can_be_extracted_after_key_is_configured(self):
+        content = render_sample(SAMPLES[0])[0]
+        uploaded = self.upload("preview.jpg", content)
+        path = f"/api/receipts/{uploaded.json()['id']}"
+        self.assertEqual(self.client.get(path).json()["status"], "ready")
+        self.assertEqual(self.client.get(f"{path}/review").status_code, 404)
+        self.assertEqual(self.upload("copy.jpg", content).status_code, 200)
+        self.assertEqual(self.client.post(f"{path}/extract").status_code, 503)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}), patch.object(
+            main, "extract_receipt", return_value=ExtractionResult(invoice(document_date="2025-11-26"), {}, "fixture", 2),
+        ):
+            self.assertEqual(self.client.post(f"{path}/extract").status_code, 202)
+        self.assertEqual(self.client.get(f"{path}/review").status_code, 200)
+        self.assertEqual(self.client.get(f"{path}/original").content, content)
+
+    def upload_review_fixture(self, fields):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}), patch.object(
+            main, "extract_receipt", return_value=ExtractionResult(fields, {}, "fixture", 2),
+        ):
+            result = self.upload("fixture.pdf", render_sample(SAMPLES[10])[0])
+        self.assertEqual(result.status_code, 202, result.text)
+        return result.json()["id"]

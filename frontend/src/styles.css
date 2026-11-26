@@ -78,6 +78,8 @@ dialog::backdrop { background: #0e211dc0; }
 .review-footer { position: sticky; bottom: 0; background: #fff; padding-top: 12px; }
 .review-confirm { width: 100%; }
 .review-category { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.review-footer .prepayment-check { margin-bottom: 8px; }
+.review-recovery { display: grid; justify-items: start; gap: 9px; }
 .review-category select { flex: 1; min-width: 0; }
 .review-category select, .tracker-filters select, .tracker-filters input, .tracker-row select, .payment-form input {
   min-height: 39px; max-width: 100%; padding: 6px 9px; border: 1px solid #9eafa9; border-radius: 7px;
@@ -101,6 +103,8 @@ dialog::backdrop { background: #0e211dc0; }
 .tracker-merchant { flex: 1 1 145px; min-width: 0; display: grid; overflow-wrap: anywhere; }
 .tracker-amount { overflow-wrap: anywhere; }
 .payment-form { width: 100%; border-top: 1px solid #e4ece8; padding-top: 10px; }
+.prepayment-check, .payment-form .prepayment-check { display: flex; align-items: center; gap: 7px; }
+.payment-form .prepayment-check input { min-height: auto; }
 .review-confirmed { color: #175c44; font-weight: 650; }
 @media (max-width: 680px) {
   .review-layout { grid-template-columns: minmax(0, 1fr); }

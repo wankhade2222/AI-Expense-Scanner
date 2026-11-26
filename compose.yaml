@@ -4,6 +4,7 @@ x-backend: &backend
     dockerfile: backend/Dockerfile
   environment:
     PYTHONPATH: /app
+    WORKSPACE_TIMEZONE: ${WORKSPACE_TIMEZONE:-Asia/Kolkata}
     EXTRACTION_PROVIDER: ${EXTRACTION_PROVIDER:-}
     GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}

@@ -19,6 +19,11 @@ type Review = {
   categories: string[]
 }
 
+type Processing = {
+  status: 'ready' | 'queued' | 'processing' | 'failed'
+  error: string | null
+}
+
 const labels: Record<string, string> = {
   merchant: 'Merchant', document_type: 'Document type', document_date: 'Document date',
   invoice_number: 'Invoice number', due_date: 'Due date', payment_status: 'Payment status',
@@ -31,26 +36,48 @@ const options: Record<string, string[]> = {
 }
 const lineLabels = { description: 'description', qty: 'quantity', unit_price: 'unit price', amount: 'amount' }
 
-export default function ReviewCard({ receiptId }: { receiptId: string }) {
+export default function ReviewCard({ receiptId, onProcessingChanged }: { receiptId: string; onProcessingChanged: () => void }) {
   const [review, setReview] = useState<Review | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
   const [category, setCategory] = useState<string | null>(null)
+  const [prepayment, setPrepayment] = useState(false)
   const [draft, setDraft] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const [reload, setReload] = useState(0)
+  const [processing, setProcessing] = useState<Processing | null>(null)
   const base = `/api/receipts/${receiptId}`
 
   useEffect(() => {
     const controller = new AbortController()
+    let timer: number | undefined
+    let wasProcessing = false
     async function load() {
       try {
         const response = await fetch(`${base}/review`, { signal: controller.signal })
-        if (response.status === 404) return
+        if (response.status === 404) {
+          const receipt = await fetch(base, { signal: controller.signal })
+          if (!receipt.ok) throw new Error('Could not load the document status.')
+          const state: Processing = await receipt.json()
+          if (controller.signal.aborted) return
+          setProcessing(state)
+          if (state.status === 'queued' || state.status === 'processing') {
+            wasProcessing = true
+            timer = window.setTimeout(load, 1500)
+          } else if (wasProcessing) {
+            wasProcessing = false
+            onProcessingChanged()
+            if (state.status === 'ready') timer = window.setTimeout(load, 0)
+          }
+          return
+        }
         if (!response.ok) throw new Error('Could not load the review.')
         const next = await response.json()
-        if (!controller.signal.aborted) setReview(next)
+        if (!controller.signal.aborted) {
+          setReview(next)
+          if (wasProcessing) onProcessingChanged()
+        }
       } catch (problem) {
         if (!controller.signal.aborted) setError(String(problem instanceof Error ? problem.message : problem))
       } finally {
@@ -58,8 +85,30 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
       }
     }
     void load()
-    return () => controller.abort()
-  }, [base, reload])
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [base, reload, onProcessingChanged])
+
+  async function runExtraction() {
+    if (busy || !processing) return
+    setBusy(true)
+    setError('')
+    try {
+      const response = await fetch(`${base}/${processing.status === 'failed' ? 'retry' : 'extract'}`, { method: 'POST' })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null)
+        throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Could not queue extraction.')
+      }
+      reloadReview()
+      onProcessingChanged()
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Could not queue extraction.')
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function change(path: string, method: string, data: object) {
     if (!review || busy) return
@@ -76,6 +125,7 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
       }
       setReview(await response.json())
       setEditing(null)
+      setPrepayment(false)
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : 'Could not save the review.')
     } finally {
@@ -88,6 +138,8 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
     setReview(null)
     setEditing(null)
     setCategory(null)
+    setPrepayment(false)
+    setProcessing(null)
     setLoaded(false)
     setReload(previous => previous + 1)
   }
@@ -96,9 +148,23 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
     <span>{error}</span> <button type="button" onClick={reloadReview}>Reload review</button>
   </div>
   if (!loaded) return <p role="status">Loading review…</p>
-  if (!review) return feedback || <p className="metadata">No extraction is available to review.</p>
+  if (!review) {
+    if (!processing) return feedback
+    if (processing.status === 'queued' || processing.status === 'processing') {
+      return <>{feedback}<p role="status">Extracting document…</p></>
+    }
+    return <div className="review-recovery">
+      {feedback}
+      <p>{processing.error || 'This document is saved and ready for extraction.'}</p>
+      <button type="button" className="primary" onClick={() => void runExtraction()} disabled={busy}>
+        {processing.status === 'failed' ? 'Retry extraction' : 'Run extraction'}
+      </button>
+    </div>
+  }
 
   const flags = review.validation.flags
+  const { payment_status, payment_date, document_date } = review.fields
+  const needsPrepayment = Boolean(payment_status === 'paid' && payment_date && document_date && payment_date < document_date)
   const rows = [
     ...Object.entries(labels).map(([field, label]) => ({ field, label, value: review.fields[field] })),
     ...review.fields.line_items.flatMap((item, index) => Object.entries(lineLabels).map(([key, label]) => ({
@@ -156,7 +222,11 @@ export default function ReviewCard({ receiptId }: { receiptId: string }) {
           {review.categories.map(name => <option key={name}>{name}</option>)}
         </select>
       </label>
-      <button type="button" className="primary review-confirm" disabled={busy || editing !== null || flags.some(flag => flag.severity === 'blocking')}
-        onClick={() => void change('/approve', 'POST', { category: category ?? review.category })}>Confirm document</button></>}</div>
+      {needsPrepayment && <label className="prepayment-check">
+        <input type="checkbox" checked={prepayment} onChange={event => setPrepayment(event.target.checked)} />
+        This payment was made before the document date.
+      </label>}
+      <button type="button" className="primary review-confirm" disabled={busy || editing !== null || (needsPrepayment && !prepayment) || flags.some(flag => flag.severity === 'blocking')}
+        onClick={() => void change('/approve', 'POST', { category: category ?? review.category, prepayment })}>Confirm document</button></>}</div>
   </section>
 }

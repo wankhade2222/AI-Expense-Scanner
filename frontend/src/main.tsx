@@ -219,7 +219,7 @@ function App() {
                 {selected.content_type === 'application/pdf' && <p className="metadata">Page 1 of {selected.page_count}</p>}
                 <a className="original" href={`/api/receipts/${selected.id}/original`}>Download original</a>
               </div>
-              <ReviewCard key={selected.id} receiptId={selected.id} />
+              <ReviewCard key={selected.id} receiptId={selected.id} onProcessingChanged={refresh} />
             </div>
           </>}
         </dialog>

@@ -4,6 +4,8 @@
 
 Choose a suggested category in Review, or change the category later in either tracker view. **Bills to pay** lists confirmed unpaid documents, with overdue bills and missing due dates marked. **Mark as paid** records the full payment on the date entered and moves the bill to the corresponding **Monthly spending** view. Monthly totals are grouped by currency and category. **Export CSV** uses the filters currently selected on the tracker.
 
+Use **Edit payment date** in Monthly spending to correct a date. Confirm any payment dated before the document date as a prepayment. Corrections keep the prior date in the audit table and move the expense to the corrected month. The API and tracker use `WORKSPACE_TIMEZONE` for calendar dates and default to `Asia/Kolkata`. Set it to an IANA timezone and restart the API and worker to change it.
+
 Run `./.venv/Scripts/python.exe -m unittest backend.test_validation backend.test_uploads` to test confirmation, payment, categorization, reporting, and export with synthetic data and mocked extraction.
 
 ## M4 review and confirmation
@@ -28,7 +30,7 @@ To use Gemini in Docker Compose, copy `.env.example` to `.env` if needed and add
 
 Set `EXTRACTION_PROVIDER=openai` and `OPENAI_API_KEY` to use OpenAI. Its default model is `gpt-4.1-mini`. With no explicit provider, the worker uses Gemini when a Gemini key is present and otherwise checks for an OpenAI key. Without a key for the selected provider, uploads still produce previews.
 
-With extraction enabled, all document pages go to the selected provider. Use synthetic or redacted documents when testing on the free tier. Both providers use the same receipt schema. The API stores typed fields and the raw response with the model and prompt version. Read the most recent successful result at `GET /api/receipts/{id}/extraction`. Use `POST /api/receipts/{id}/extract` on an existing Ready document to run extraction or create a new version.
+With extraction enabled, all document pages go to the selected provider. Use synthetic or redacted documents when testing on the free tier. Both providers use the same receipt schema. The API stores typed fields and the raw response with the model and prompt version. Read the most recent successful result at `GET /api/receipts/{id}/extraction`. If a Ready upload only has a preview, open **Review** and select **Run extraction** once a provider is configured. The same action is available at `POST /api/receipts/{id}/extract`.
 
 Run `docker compose exec api python -m backend.extraction_samples` to compare live output against 20 labelled synthetic receipts and invoices. For local Python, set the provider variables in your shell and run `./.venv/Scripts/python.exe -m backend.extraction_samples`. Start with `--limit 1` for a smoke test. A full run makes up to 20 provider calls and counts toward the provider quota. Automated tests mock the provider responses.
 

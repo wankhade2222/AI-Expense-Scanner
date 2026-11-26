@@ -1,14 +1,17 @@
 import csv
 import io
+import os
 import re
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from babel.numbers import get_currency_precision
 from pydantic import BaseModel, ConfigDict
 
 CATEGORIES = ("Software", "Office supplies", "Travel", "Meals", "Professional services", "Utilities", "Uncategorized")
+WORKSPACE_TIMEZONE = ZoneInfo(os.getenv("WORKSPACE_TIMEZONE") or "Asia/Kolkata")
 CATEGORY_RULES = (
     ("Software", r"software|hosting|adobe|github|domain|saas"),
     ("Office supplies", r"stationery|paper|printing|office supplies"),
@@ -47,11 +50,19 @@ class ExpenseReport(BaseModel):
     totals: list[TrackerTotal]
     category_totals: list[TrackerTotal]
     categories: tuple[str, ...] = CATEGORIES
+    today: date
+    month: str | None
+    next_day_at: datetime
 
 
 class PaymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     paid_on: str
+    prepayment: bool = False
+
+
+class PaymentCorrectionRequest(PaymentRequest):
+    previous_paid_on: str
 
 
 class CategoryRequest(BaseModel):
@@ -59,8 +70,8 @@ class CategoryRequest(BaseModel):
     category: str
 
 
-def today_utc() -> date:
-    return datetime.now(timezone.utc).date()
+def workspace_today(now: datetime | None = None) -> date:
+    return now.astimezone(WORKSPACE_TIMEZONE).date() if now is not None else datetime.now(WORKSPACE_TIMEZONE).date()
 
 
 def tracker_category(fields: dict) -> str:
@@ -80,7 +91,7 @@ def amount_text(amount: int, currency: str) -> str:
 
 def tracker_expense(
     receipt_id: str, fields: dict, currency: str, amounts_minor: dict[str, int],
-    *, paid_on: date | None, category: str | None,
+    *, paid_on: date | None, category: str | None, today: date,
 ) -> TrackerExpense:
     if paid_on is None and fields["payment_status"] == "paid":
         paid_on = date.fromisoformat(fields["payment_date"])
@@ -96,11 +107,11 @@ def tracker_expense(
         currency=currency, total_minor=str(amount), amount=amount_text(amount, currency),
         amount_breakdown={name: amount_text(amounts_minor[name], currency)
                           for name in ("subtotal", "discount", "tax", "fees", "rounding") if name in amounts_minor},
-        overdue=paid_on is None and due_date is not None and due_date < today_utc(),
+        overdue=paid_on is None and due_date is not None and due_date < today,
     )
 
 
-def summarize(expenses: list[TrackerExpense]) -> ExpenseReport:
+def summarize(expenses: list[TrackerExpense], *, today: date, month: str | None) -> ExpenseReport:
     totals: dict[str, int] = defaultdict(int)
     categories: dict[tuple[str, str], int] = defaultdict(int)
     for expense in expenses:
@@ -109,6 +120,8 @@ def summarize(expenses: list[TrackerExpense]) -> ExpenseReport:
         categories[(expense.currency, expense.category)] += amount
     return ExpenseReport(
         expenses=expenses,
+        today=today, month=month,
+        next_day_at=datetime.combine(today + timedelta(days=1), time.min, tzinfo=WORKSPACE_TIMEZONE),
         totals=[TrackerTotal(currency=currency, category=None, total_minor=str(total), amount=amount_text(total, currency))
                 for currency, total in sorted(totals.items())],
         category_totals=[TrackerTotal(currency=currency, category=category, total_minor=str(total), amount=amount_text(total, currency))

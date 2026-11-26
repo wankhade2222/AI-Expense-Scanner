@@ -22,8 +22,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt, extraction_config
 from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, parse_date, validate_receipt
 from backend.tracker import (
-    CATEGORIES, CategoryRequest, ExpenseReport, PaymentRequest, TrackerExpense, expense_csv,
-    summarize, today_utc, tracker_category, tracker_expense,
+    CATEGORIES, CategoryRequest, ExpenseReport, PaymentCorrectionRequest, PaymentRequest, TrackerExpense, expense_csv,
+    summarize, tracker_category, tracker_expense, workspace_today,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +149,18 @@ class ExpenseTracking(Base):
     paid_on: Mapped[date | None] = mapped_column(Date)
 
 
+class ExpensePaymentChange(Base):
+    __tablename__ = "expense_payment_changes"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(ForeignKey("expenses.receipt_id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(80))
+    previous_paid_on: Mapped[date | None] = mapped_column(Date)
+    paid_on: Mapped[date] = mapped_column(Date)
+    prepayment: Mapped[bool]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ReviewVersion(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     extraction_id: str
@@ -161,6 +173,7 @@ class EditRequest(ReviewVersion):
 
 class ApprovalRequest(ReviewVersion):
     category: str | None = None
+    prepayment: bool = False
 
 
 class ReviewView(BaseModel):
@@ -173,7 +186,7 @@ class ReviewView(BaseModel):
 
 
 def validation_for(extraction_id: str, fields: ReceiptExtraction) -> SavedValidation:
-    report = validate_receipt(fields, today=datetime.now(timezone.utc).date())
+    report = validate_receipt(fields, today=workspace_today())
     return SavedValidation(
         extraction_id=extraction_id, fingerprint=duplicate_fingerprint(fields, report),
         invoice_identity=invoice_identity(fields.invoice_number) if fields.document_type == "invoice" else None,
@@ -667,6 +680,9 @@ def approve_receipt(receipt_id: str, version: ApprovalRequest) -> ReviewView:
             raise HTTPException(422, "Resolve the required flags before confirming.")
         category = version.category or current.category
         validate_category(category)
+        payment_date = current.fields.payment_date
+        if current.fields.payment_status == "paid" and payment_date < current.fields.document_date and not version.prepayment:
+            raise HTTPException(422, "Confirm that this payment was made before the document date.")
         session.add(Expense(
             receipt_id=receipt_id, extraction_id=version.extraction_id, revision=version.revision,
             fields=current.fields.model_dump(), currency=currency, amounts_minor=current.validation.amounts_minor,
@@ -711,15 +727,16 @@ def validate_category(category: str) -> None:
         raise HTTPException(422, "Choose a category from the list.")
 
 
-def expense_view(expense: Expense, tracking: ExpenseTracking | None) -> TrackerExpense:
+def expense_view(expense: Expense, tracking: ExpenseTracking | None, *, today: date) -> TrackerExpense:
     return tracker_expense(
         expense.receipt_id, expense.fields, expense.currency, expense.amounts_minor,
         paid_on=tracking.paid_on if tracking else None, category=tracking.category if tracking else None,
+        today=today,
     )
 
 
 def filtered_expenses(
-    session: Session, payment_status: str, month: str | None, category: str | None,
+    session: Session, payment_status: str, month: str | None, category: str | None, *, today: date,
 ) -> list[TrackerExpense]:
     if month is not None:
         if payment_status != "paid":
@@ -736,7 +753,7 @@ def filtered_expenses(
     )
     expenses = []
     for expense, tracking in rows:
-        current = expense_view(expense, tracking)
+        current = expense_view(expense, tracking, today=today)
         if current.status != payment_status or (category and category != current.category):
             continue
         if month is None or (current.paid_on and current.paid_on.isoformat()[:7] == month):
@@ -748,14 +765,18 @@ def filtered_expenses(
 
 @app.get("/api/expenses")
 def list_expenses(status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> ExpenseReport:
+    today = workspace_today()
+    month = today.isoformat()[:7] if month == "current" else month
     with Session(engine) as session:
-        return summarize(filtered_expenses(session, status, month, category))
+        return summarize(filtered_expenses(session, status, month, category, today=today), today=today, month=month)
 
 
 @app.get("/api/expenses/export.csv")
 def export_expenses(status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> Response:
+    today = workspace_today()
+    month = today.isoformat()[:7] if month == "current" else month
     with Session(engine) as session:
-        rows = filtered_expenses(session, status, month, category)
+        rows = filtered_expenses(session, status, month, category, today=today)
     return Response(
         expense_csv(rows), media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="expenses.csv"', "Cache-Control": "private, no-store"},
@@ -776,21 +797,39 @@ def lock_expense(session: Session, receipt_id: str) -> tuple[Expense, ExpenseTra
 
 @app.post("/api/expenses/{receipt_id}/mark-paid")
 def mark_paid(receipt_id: str, request: PaymentRequest) -> TrackerExpense:
+    return save_payment(receipt_id, request)
+
+
+@app.patch("/api/expenses/{receipt_id}/payment")
+def correct_payment(receipt_id: str, request: PaymentCorrectionRequest) -> TrackerExpense:
+    return save_payment(receipt_id, request, previous_paid_on=request.previous_paid_on)
+
+
+def save_payment(receipt_id: str, request: PaymentRequest, previous_paid_on: str | None = None) -> TrackerExpense:
     try:
         paid_on = parse_date(request.paid_on)
     except ValueError as exc:
         raise HTTPException(422, "Enter a valid payment date in YYYY-MM-DD format.") from exc
-    if paid_on > today_utc():
+    today = workspace_today()
+    if paid_on > today:
         raise HTTPException(422, "A completed payment cannot have a future date.")
     with Session(engine) as session:
         expense, tracking = lock_expense(session, receipt_id)
-        current = expense_view(expense, tracking)
-        if current.paid_on is not None:
-            if current.paid_on == paid_on:
-                return current
-            raise HTTPException(409, "This expense already has a different payment date.")
+        current = expense_view(expense, tracking, today=today)
+        if current.paid_on == paid_on:
+            return current
+        saved_date = current.paid_on.isoformat() if current.paid_on else None
+        if saved_date != previous_paid_on:
+            raise HTTPException(409, "The payment date changed. Refresh the tracker before editing it.")
+        prepayment = paid_on < current.document_date
+        if prepayment and not request.prepayment:
+            raise HTTPException(422, "Confirm that this payment was made before the document date.")
         tracking.paid_on = paid_on
-        result = expense_view(expense, tracking)
+        session.add(ExpensePaymentChange(
+            id=uuid4().hex, receipt_id=receipt_id, user_id=owner, previous_paid_on=current.paid_on,
+            paid_on=paid_on, prepayment=prepayment, created_at=datetime.now(timezone.utc),
+        ))
+        result = expense_view(expense, tracking, today=today)
         session.commit()
         return result
 
@@ -801,6 +840,6 @@ def change_category(receipt_id: str, request: CategoryRequest) -> TrackerExpense
     with Session(engine) as session:
         expense, tracking = lock_expense(session, receipt_id)
         tracking.category = request.category
-        result = expense_view(expense, tracking)
+        result = expense_view(expense, tracking, today=workspace_today())
         session.commit()
         return result
