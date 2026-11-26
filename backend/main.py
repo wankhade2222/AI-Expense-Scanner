@@ -14,8 +14,8 @@ from uuid import uuid4
 import pypdfium2 as pdfium
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile, status
 from PIL import Image, ImageOps
-from pydantic import BaseModel
-from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, create_engine, select, update
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, case, create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
@@ -102,6 +102,58 @@ class SavedValidation(Base):
     report: Mapped[dict] = mapped_column(JSON)
 
 
+class Review(Base):
+    __tablename__ = "receipt_reviews"
+
+    extraction_id: Mapped[str] = mapped_column(ForeignKey("extractions.id"), primary_key=True)
+    revision: Mapped[int]
+    fields: Mapped[dict] = mapped_column(JSON)
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
+    invoice_identity: Mapped[str | None] = mapped_column(String)
+
+
+class Correction(Base):
+    __tablename__ = "receipt_corrections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    extraction_id: Mapped[str] = mapped_column(ForeignKey("extractions.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(80))
+    revision: Mapped[int]
+    field: Mapped[str]
+    previous_value: Mapped[str | None]
+    new_value: Mapped[str | None]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Expense(Base):
+    __tablename__ = "expenses"
+
+    receipt_id: Mapped[str] = mapped_column(ForeignKey("receipts.id"), primary_key=True)
+    extraction_id: Mapped[str] = mapped_column(ForeignKey("extractions.id"))
+    revision: Mapped[int]
+    fields: Mapped[dict] = mapped_column(JSON)
+    currency: Mapped[str] = mapped_column(String(3))
+    amounts_minor: Mapped[dict] = mapped_column(JSON)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ReviewVersion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    extraction_id: str
+    revision: int = Field(ge=0)
+
+
+class EditRequest(ReviewVersion):
+    value: str | None = Field(max_length=1000)
+
+
+class ReviewView(BaseModel):
+    version: ReviewVersion
+    fields: ReceiptExtraction
+    validation: ValidationReport
+    confirmed: bool
+
+
 def validation_for(extraction_id: str, fields: ReceiptExtraction) -> SavedValidation:
     report = validate_receipt(fields, today=datetime.now(timezone.utc).date())
     return SavedValidation(
@@ -115,14 +167,17 @@ def report_with_duplicates(session: Session, saved: SavedValidation, receipt: Re
     report = ValidationReport.model_validate(saved.report)
     if saved.fingerprint is None:
         return report
+    fingerprint = case((Review.extraction_id.is_not(None), Review.fingerprint), else_=SavedValidation.fingerprint)
+    invoice_number = case((Review.extraction_id.is_not(None), Review.invoice_identity), else_=SavedValidation.invoice_identity)
     candidate = (
         select(Receipt.id).join(SavedValidation, Receipt.attempt == SavedValidation.extraction_id)
+        .outerjoin(Review, Review.extraction_id == SavedValidation.extraction_id)
         .where(Receipt.user_id == receipt.user_id, Receipt.id != receipt.id, Receipt.status == "ready",
-               SavedValidation.fingerprint == saved.fingerprint)
+               fingerprint == saved.fingerprint)
     )
     if saved.invoice_identity is not None:
         candidate = candidate.where(
-            (SavedValidation.invoice_identity == saved.invoice_identity) | SavedValidation.invoice_identity.is_(None),
+            (invoice_number == saved.invoice_identity) | invoice_number.is_(None),
         )
     if session.scalar(candidate.limit(1)) is not None:
         report.flags.append(ValidationFlag(
@@ -200,10 +255,14 @@ def extraction_pages(data: bytes, content_type: str) -> list[bytes]:
     pages = []
     with pdf_lock, pdfium.PdfDocument(data) as document:
         for page_index in range(len(document)):
-            with closing(document[page_index]) as page:
-                with closing(page.render(scale=1800 / max(page.get_size()))) as bitmap:
-                    pages.append(jpeg(bitmap.to_pil().convert("RGB")))
+            pages.append(jpeg(render_pdf_page(document, page_index)))
     return pages
+
+
+def render_pdf_page(document, page_index: int) -> Image.Image:
+    with closing(document[page_index]) as page:
+        with closing(page.render(scale=1800 / max(page.get_size()))) as bitmap:
+            return bitmap.to_pil().convert("RGB")
 
 
 def process_receipt(receipt_id: str, attempt: str) -> None:
@@ -452,7 +511,9 @@ def queue_again(receipt_id: str, tasks: BackgroundTasks, expected_status: str) -
     attempt = uuid4().hex
     with Session(engine) as session:
         expire_jobs(session, receipt_id)
-        get_receipt(session, receipt_id)
+        lock_receipt(session, receipt_id)
+        if session.get(Expense, receipt_id) is not None:
+            raise HTTPException(409, "This document has already been confirmed.")
         changed = session.execute(
             update(Receipt)
             .where(Receipt.id == receipt_id, Receipt.user_id == owner, Receipt.status == expected_status)
@@ -480,3 +541,138 @@ def receipt_extraction(receipt_id: str) -> ExtractionView:
             latency_ms=extraction.latency_ms, fields=ReceiptExtraction.model_validate(extraction.fields),
             validation=report_with_duplicates(session, session.get(SavedValidation, extraction.id), receipt),
         )
+
+
+def lock_receipt(session: Session, receipt_id: str) -> None:
+    # A write locks the same receipt row for review edits, confirmation, and re-extraction.
+    changed = session.execute(
+        update(Receipt).where(Receipt.id == receipt_id, Receipt.user_id == owner)
+        .values(updated_at=Receipt.updated_at),
+    ).rowcount
+    if not changed:
+        raise HTTPException(404, "Document not found.")
+
+
+def load_review(session: Session, receipt_id: str) -> tuple[Receipt, Review | None, ReviewView]:
+    receipt = get_receipt(session, receipt_id)
+    expense = session.get(Expense, receipt_id)
+    extraction = session.get(Extraction, receipt.attempt)
+    if receipt.status != "ready" or extraction is None:
+        raise HTTPException(404, "This document has no completed extraction to review.")
+    review = session.get(Review, extraction.id)
+    fields = ReceiptExtraction.model_validate(expense.fields if expense else review.fields if review else extraction.fields)
+    saved = validation_for(extraction.id, fields)
+    return receipt, review, ReviewView(
+        version=ReviewVersion(extraction_id=extraction.id, revision=review.revision if review else 0),
+        fields=fields, validation=report_with_duplicates(session, saved, receipt), confirmed=expense is not None,
+    )
+
+
+def check_version(current: ReviewView, expected: ReviewVersion) -> None:
+    if (current.version.extraction_id, current.version.revision) != (expected.extraction_id, expected.revision):
+        raise HTTPException(409, "The review changed. Reload it before continuing.")
+
+
+@app.get("/api/receipts/{receipt_id}/review")
+def receipt_review(receipt_id: str) -> ReviewView:
+    with Session(engine) as session:
+        return load_review(session, receipt_id)[2]
+
+
+@app.patch("/api/receipts/{receipt_id}/fields/{field}")
+def edit_field(receipt_id: str, field: str, edit: EditRequest) -> ReviewView:
+    with Session(engine) as session:
+        lock_receipt(session, receipt_id)
+        _, review, current = load_review(session, receipt_id)
+        check_version(current, edit)
+        if current.confirmed:
+            raise HTTPException(409, "This document has already been confirmed.")
+
+        fields = current.fields.model_dump()
+        target, key = fields, field
+        if field.startswith("line_items."):
+            parts = field.split(".")
+            if len(parts) != 3 or not parts[1].isascii() or not parts[1].isdigit() or len(parts[1]) > 8:
+                raise HTTPException(404, "Unknown review field.")
+            index, key = int(parts[1]), parts[2]
+            if index >= len(fields["line_items"]) or str(index) != parts[1]:
+                raise HTTPException(404, "Unknown line item.")
+            target = fields["line_items"][index]
+        elif field in ("line_items", "sources"):
+            raise HTTPException(404, "Unknown review field.")
+        if key not in target:
+            raise HTTPException(404, "Unknown review field.")
+
+        value = (edit.value or "").strip() or None
+        previous = target[key]
+        if previous == value:
+            return current
+        target[key] = value
+        try:
+            updated_fields = ReceiptExtraction.model_validate(fields)
+        except ValidationError as exc:
+            raise HTTPException(422, "Choose a valid value for this field.") from exc
+
+        revision = current.version.revision + 1
+        validation = validation_for(edit.extraction_id, updated_fields)
+        if review is None:
+            review = Review(extraction_id=edit.extraction_id)
+            session.add(review)
+        review.revision, review.fields = revision, fields
+        review.fingerprint, review.invoice_identity = validation.fingerprint, validation.invoice_identity
+        session.add(Correction(
+            id=uuid4().hex, extraction_id=edit.extraction_id, user_id=owner, revision=revision,
+            field=field, previous_value=previous, new_value=value, created_at=datetime.now(timezone.utc),
+        ))
+        session.flush()
+        response = load_review(session, receipt_id)[2]
+        session.commit()
+        return response
+
+
+@app.post("/api/receipts/{receipt_id}/approve")
+def approve_receipt(receipt_id: str, version: ReviewVersion) -> ReviewView:
+    with Session(engine) as session:
+        lock_receipt(session, receipt_id)
+        _, _, current = load_review(session, receipt_id)
+        check_version(current, version)
+        if current.confirmed:
+            return current
+        currency = current.validation.currency
+        if currency is None or any(flag.severity == "blocking" for flag in current.validation.flags):
+            raise HTTPException(422, "Resolve the required flags before confirming.")
+        session.add(Expense(
+            receipt_id=receipt_id, extraction_id=version.extraction_id, revision=version.revision,
+            fields=current.fields.model_dump(), currency=currency, amounts_minor=current.validation.amounts_minor,
+            confirmed_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+        return current.model_copy(update={"confirmed": True})
+
+
+@app.get("/api/receipts/{receipt_id}/review/source")
+def review_source(receipt_id: str, field: str, extraction_id: str) -> Response:
+    with Session(engine) as session:
+        receipt, _, review = load_review(session, receipt_id)
+        if review.version.extraction_id != extraction_id:
+            raise HTTPException(409, "The review changed. Reload it before continuing.")
+        locations = [source for source in review.fields.sources if source.field == field]
+        source = next((source for source in locations if source.box), locations[0] if locations else None)
+        if source is None or source.page > (receipt.page_count or 0):
+            raise HTTPException(404, "No source location is available.")
+        original = load(receipt.storage_key)
+        if receipt.content_type == "application/pdf":
+            with pdf_lock, pdfium.PdfDocument(original) as document:
+                image = render_pdf_page(document, source.page - 1)
+        else:
+            with Image.open(io.BytesIO(original)) as photo:
+                image = ImageOps.exif_transpose(photo).convert("RGB")
+        if source.box:
+            left, top, right, bottom = source.box
+            width, height = image.size
+            x, y = int(left * width), int(top * height)
+            image = image.crop((x, y, max(x + 1, int(right * width)), max(y + 1, int(bottom * height))))
+        image.thumbnail((1000, 1000))
+        output = io.BytesIO()
+        image.save(output, "JPEG", quality=88)
+        return Response(output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})

@@ -152,3 +152,50 @@ class UploadTests(unittest.TestCase):
             report = response.json()["validation"]
             self.assertEqual(report["totals_check"], "matched")
             self.assertEqual(any(flag["code"] == "possible_duplicate" for flag in report["flags"]), index < 2)
+
+    def test_review_crop_correction_version_and_repeat_confirmation(self):
+        document, _ = render_sample(SAMPLES[10])
+        fields = invoice(
+            document_date="2025-09-01", currency=None, total="1500",
+            sources=[{"field": "total", "page": 2, "box": [0.1, 0.1, 0.5, 0.5]}],
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}), patch.object(
+            main, "extract_receipt", return_value=ExtractionResult(fields, {}, "fixture", 2),
+        ):
+            uploaded = self.upload("review.pdf", document)
+        path = f"/api/receipts/{uploaded.json()['id']}"
+        initial = self.client.get(f"{path}/review").json()
+        version = initial["version"]
+        self.assertEqual(self.client.post(f"{path}/approve", json=version).status_code, 422)
+        crop = self.client.get(f"{path}/review/source", params={"field": "total", "extraction_id": version["extraction_id"]})
+        self.assertEqual(crop.status_code, 200)
+        with Image.open(io.BytesIO(crop.content)) as image:
+            self.assertLess(image.width, 1000)
+            image.verify()
+
+        def edit(field, value, edit_version):
+            return self.client.patch(f"{path}/fields/{field}", json={**edit_version, "value": value})
+
+        currency = edit("currency", "INR", version).json()
+        self.assertEqual(currency["validation"]["totals_check"], "mismatch")
+        self.assertEqual(edit("total", "1416", version).status_code, 409)
+        fixed = edit("total", "1416", currency["version"]).json()
+        self.assertEqual(fixed["validation"]["totals_check"], "matched")
+        self.assertEqual(fixed["fields"]["total"], "1416")
+        self.assertEqual(self.client.get(f"{path}/extraction").json()["fields"]["total"], "1500")
+        self.assertEqual(self.client.post(f"{path}/approve", json=version).status_code, 409)
+
+        # Two requests for the same reviewed version produce one confirmed expense.
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            approvals = list(pool.map(lambda _: self.client.post(f"{path}/approve", json=fixed["version"]), range(2)))
+        self.assertTrue(all(result.status_code == 200 and result.json()["confirmed"] for result in approvals))
+        self.assertEqual(edit("total", "1440", fixed["version"]).status_code, 409)
+        with main.Session(main.engine) as session:
+            expense = session.get(main.Expense, uploaded.json()["id"])
+            self.assertEqual(expense.amounts_minor["total"], 141_600)
+            corrections = session.scalars(main.select(main.Correction).order_by(main.Correction.revision)).all()
+            self.assertEqual([(row.field, row.previous_value, row.new_value) for row in corrections], [
+                ("currency", None, "INR"), ("total", "1500", "1416"),
+            ])
