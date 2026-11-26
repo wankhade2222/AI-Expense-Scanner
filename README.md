@@ -1,5 +1,13 @@
 # AI Expense Scanner
 
+## M2 structured extraction
+
+Set `OPENAI_API_KEY` in the API process environment for local Python, or place it in the ignored `.env` file for Docker Compose. Restart the API and worker after changing configuration. `OPENAI_MODEL` defaults to `gpt-4.1-mini`. Without a key, uploads still produce previews.
+
+With extraction enabled, all pages of each new document go to OpenAI. Use synthetic or redacted samples. The API stores typed fields and the raw response with the model and prompt version. Read the most recent successful result at `GET /api/receipts/{id}/extraction`. Use `POST /api/receipts/{id}/extract` on an existing Ready document to run extraction or create a new version.
+
+To compare live model output against 20 labelled synthetic receipts and invoices, set the key in your shell and run `./.venv/Scripts/python.exe -m backend.extraction_samples`. This makes 20 billable API requests on a complete run. The regular unit tests use mocked provider responses.
+
 A receipt and supplier invoice scanner for solo freelancers. M1 covers upload, private file storage, previews, status, duplicate detection, and retry.
 
 ## Local development

@@ -15,9 +15,11 @@ import pypdfium2 as pdfium
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile, status
 from PIL import Image, ImageOps
 from pydantic import BaseModel
-from sqlalchemy import DateTime, String, UniqueConstraint, create_engine, select, update
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt
 
 logger = logging.getLogger(__name__)
 data_dir = Path(os.getenv("DATA_DIR", ".data")).resolve()
@@ -66,6 +68,27 @@ class ReceiptView(BaseModel):
     page_count: int | None
     preview_url: str | None
     error: str | None
+
+
+class Extraction(Base):
+    __tablename__ = "extractions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(ForeignKey("receipts.id"), index=True)
+    model: Mapped[str] = mapped_column(String(100))
+    prompt_version: Mapped[str] = mapped_column(String(32))
+    fields: Mapped[dict] = mapped_column(JSON)
+    raw_json: Mapped[dict] = mapped_column(JSON)
+    latency_ms: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ExtractionView(BaseModel):
+    id: str
+    model: str
+    prompt_version: str
+    latency_ms: int
+    fields: ReceiptExtraction
 
 
 @lru_cache
@@ -123,6 +146,25 @@ def prepare_preview(data: bytes, content_type: str) -> tuple[bytes, int]:
     return output.getvalue(), count
 
 
+def extraction_pages(data: bytes, content_type: str) -> list[bytes]:
+    def jpeg(image: Image.Image) -> bytes:
+        image.thumbnail((1800, 1800))
+        buffer = io.BytesIO()
+        image.save(buffer, "JPEG", quality=88)
+        return buffer.getvalue()
+
+    if content_type != "application/pdf":
+        with Image.open(io.BytesIO(data)) as source:
+            return [jpeg(ImageOps.exif_transpose(source).convert("RGB"))]
+    pages = []
+    with pdf_lock, pdfium.PdfDocument(data) as document:
+        for page_index in range(len(document)):
+            with closing(document[page_index]) as page:
+                with closing(page.render(scale=1800 / max(page.get_size()))) as bitmap:
+                    pages.append(jpeg(bitmap.to_pil().convert("RGB")))
+    return pages
+
+
 def process_receipt(receipt_id: str, attempt: str) -> None:
     with Session(engine) as session:
         receipt = session.execute(
@@ -136,21 +178,37 @@ def process_receipt(receipt_id: str, attempt: str) -> None:
         storage_key, content_type = receipt.storage_key, receipt.content_type
         session.commit()
 
+    extracted = None
+    count = None
     try:
-        preview, count = prepare_preview(load(storage_key), content_type)
+        original = load(storage_key)
+        preview, count = prepare_preview(original, content_type)
         store(preview_key(receipt_id, attempt), preview, "image/jpeg")
+        if api_key := os.getenv("OPENAI_API_KEY"):
+            extracted = extract_receipt(
+                extraction_pages(original, content_type), api_key=api_key,
+                model=os.getenv("OPENAI_MODEL") or "gpt-4.1-mini",
+            )
         result = {"status": "ready", "page_count": count, "error": None}
+    except ExtractionError as exc:
+        result = {"status": "failed", "page_count": count, "error": str(exc)}
     except Exception as exc:
         logger.exception("Could not prepare receipt %s", receipt_id)
         error = str(exc) if type(exc) is ValueError else "Could not read this file. Retry or upload a fresh copy."
         result = {"status": "failed", "error": error}
 
     with Session(engine) as session:
-        session.execute(
+        changed = session.execute(
             update(Receipt)
             .where(Receipt.id == receipt_id, Receipt.attempt == attempt, Receipt.status == "processing")
             .values(**result, updated_at=datetime.now(timezone.utc))
-        )
+        ).rowcount
+        if changed and extracted is not None:
+            session.add(Extraction(
+                id=attempt, receipt_id=receipt_id, model=extracted.model, prompt_version=PROMPT_VERSION,
+                fields=extracted.fields.model_dump(), raw_json=extracted.raw_json,
+                latency_ms=extracted.latency_ms, created_at=datetime.now(timezone.utc),
+            ))
         session.commit()
 
 
@@ -220,7 +278,7 @@ def view(receipt: Receipt) -> ReceiptView:
         id=receipt.id, filename=receipt.filename, content_type=receipt.content_type,
         size=receipt.size, status=receipt.status, created_at=created_at,
         page_count=receipt.page_count, error=receipt.error,
-        preview_url=f"/api/receipts/{receipt.id}/preview" if receipt.status == "ready" else None,
+        preview_url=f"/api/receipts/{receipt.id}/preview" if receipt.status in ("ready", "failed") and receipt.page_count else None,
     )
 
 
@@ -310,7 +368,7 @@ def receipt_details(receipt_id: str) -> ReceiptView:
 def receipt_preview(receipt_id: str) -> Response:
     with Session(engine) as session:
         receipt = get_receipt(session, receipt_id)
-        if receipt.status != "ready":
+        if receipt.status not in ("ready", "failed") or receipt.page_count is None:
             raise HTTPException(404, "Preview is not available yet.")
         return Response(
             load(preview_key(receipt.id, receipt.attempt)),
@@ -330,17 +388,44 @@ def receipt_original(receipt_id: str) -> Response:
 
 @app.post("/api/receipts/{receipt_id}/retry", status_code=status.HTTP_202_ACCEPTED)
 def retry(receipt_id: str, tasks: BackgroundTasks) -> ReceiptView:
+    return queue_again(receipt_id, tasks, "failed")
+
+
+@app.post("/api/receipts/{receipt_id}/extract", status_code=status.HTTP_202_ACCEPTED)
+def extract_again(receipt_id: str, tasks: BackgroundTasks) -> ReceiptView:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(503, "Set OPENAI_API_KEY to enable extraction.")
+    return queue_again(receipt_id, tasks, "ready")
+
+
+def queue_again(receipt_id: str, tasks: BackgroundTasks, expected_status: str) -> ReceiptView:
     attempt = uuid4().hex
     with Session(engine) as session:
         expire_jobs(session, receipt_id)
         get_receipt(session, receipt_id)
         changed = session.execute(
             update(Receipt)
-            .where(Receipt.id == receipt_id, Receipt.user_id == owner, Receipt.status == "failed")
-            .values(status="queued", attempt=attempt, error=None, updated_at=datetime.now(timezone.utc))
+            .where(Receipt.id == receipt_id, Receipt.user_id == owner, Receipt.status == expected_status)
+            .values(status="queued", attempt=attempt, page_count=None, error=None, updated_at=datetime.now(timezone.utc))
         ).rowcount
         if not changed:
-            raise HTTPException(409, "Only failed documents can be retried.")
+            raise HTTPException(409, "This document cannot be queued in its current state.")
         session.commit()
     start_job(tasks, receipt_id, attempt)
     return receipt_details(receipt_id)
+
+
+@app.get("/api/receipts/{receipt_id}/extraction")
+def receipt_extraction(receipt_id: str) -> ExtractionView:
+    with Session(engine) as session:
+        get_receipt(session, receipt_id)
+        extraction = session.scalar(
+            select(Extraction).where(Extraction.receipt_id == receipt_id)
+            .order_by(Extraction.created_at.desc(), Extraction.id.desc()).limit(1)
+        )
+        if extraction is None:
+            raise HTTPException(404, "No completed extraction is available.")
+        return ExtractionView(
+            id=extraction.id, model=extraction.model, prompt_version=extraction.prompt_version,
+            latency_ms=extraction.latency_ms, fields=ReceiptExtraction.model_validate(extraction.fields),
+        )

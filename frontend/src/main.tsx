@@ -15,6 +15,16 @@ type Receipt = {
   error: string | null
 }
 
+type Extraction = {
+  fields: {
+    merchant: string | null
+    document_date: string | null
+    currency: string | null
+    total: string | null
+    payment_status: 'paid' | 'unpaid' | 'unknown'
+  }
+}
+
 const statusLabels = { queued: 'Queued', processing: 'Processing', ready: 'Ready', failed: 'Failed' }
 const dateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 const supported = 'image/jpeg,image/png,image/webp,application/pdf,.pdf'
@@ -46,6 +56,7 @@ function App() {
   const [listError, setListError] = useState('')
   const [notice, setNotice] = useState('')
   const [selected, setSelected] = useState<Receipt | null>(null)
+  const [extraction, setExtraction] = useState<Extraction | null>(null)
   const [retrying, setRetrying] = useState<string | null>(null)
   const picker = useRef<HTMLInputElement>(null)
   const camera = useRef<HTMLInputElement>(null)
@@ -74,6 +85,16 @@ function App() {
   useEffect(() => {
     if (selected) dialog.current?.showModal()
     else dialog.current?.close()
+  }, [selected])
+
+  useEffect(() => {
+    setExtraction(null)
+    if (!selected) return
+    const controller = new AbortController()
+    void request<Extraction>(`/${selected.id}/extraction`, { signal: controller.signal })
+      .then(result => { if (!controller.signal.aborted) setExtraction(result) })
+      .catch(() => {})
+    return () => controller.abort()
   }, [selected])
 
   function remember(receipt: Receipt) {
@@ -195,6 +216,12 @@ function App() {
             <div className="dialog-title"><h2 id="preview-title">{selected.filename}</h2><button aria-label="Close preview" onClick={() => setSelected(null)}><X size={19} /></button></div>
             <img className="preview" src={selected.preview_url ?? undefined} alt={`Preview of ${selected.filename}`} />
             {selected.content_type === 'application/pdf' && <p className="metadata">Page 1 of {selected.page_count}</p>}
+            {extraction && <dl className="extracted">
+              <div><dt>Merchant</dt><dd>{extraction.fields.merchant ?? 'Unknown'}</dd></div>
+              <div><dt>Document date</dt><dd>{extraction.fields.document_date ?? 'Unknown'}</dd></div>
+              <div><dt>Printed total</dt><dd>{extraction.fields.total ?? 'Unknown'} {extraction.fields.currency}</dd></div>
+              <div><dt>Payment status</dt><dd>{extraction.fields.payment_status}</dd></div>
+            </dl>}
             <a className="original" href={`/api/receipts/${selected.id}/original`}>Download original</a>
           </>}
         </dialog>
