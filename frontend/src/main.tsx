@@ -23,6 +23,15 @@ type Extraction = {
     total: string | null
     payment_status: 'paid' | 'unpaid' | 'unknown'
   }
+  validation?: {
+    flags: Array<{
+      field: string
+      code: string
+      severity: 'blocking' | 'warning'
+      reason: string
+      source: { page: number } | null
+    }>
+  }
 }
 
 const statusLabels = { queued: 'Queued', processing: 'Processing', ready: 'Ready', failed: 'Failed' }
@@ -222,6 +231,18 @@ function App() {
               <div><dt>Printed total</dt><dd>{extraction.fields.total ?? 'Unknown'} {extraction.fields.currency}</dd></div>
               <div><dt>Payment status</dt><dd>{extraction.fields.payment_status}</dd></div>
             </dl>}
+            {extraction?.validation && extraction.validation.flags.length > 0 &&
+              <section className="validation-flags" aria-labelledby="validation-heading">
+                <h3 id="validation-heading">Needs review</h3>
+                <ul>
+                  {extraction.validation.flags.map(flag =>
+                    <li key={`${flag.field}:${flag.code}`}>
+                      <strong>{flag.severity === 'blocking' ? 'Required' : 'Check'}</strong>
+                      {' · '}{flag.reason}{flag.source && ` (page ${flag.source.page})`}
+                    </li>
+                  )}
+                </ul>
+              </section>}
             <a className="original" href={`/api/receipts/${selected.id}/original`}>Download original</a>
           </>}
         </dialog>

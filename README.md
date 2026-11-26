@@ -1,5 +1,15 @@
 # AI Expense Scanner
 
+## M3 validation and flags
+
+Open a processed document preview to see its review flags. The extraction endpoint also returns a `validation` object with amounts in integer minor units, reconciliation status, flag severity, a reason, and source page or region when available. Reconciliation checks tax-inclusive and tax-exclusive interpretations and allows one minor unit of rounding. Possible duplicate checks are scoped to the local user and compare different uploads, with different explicit supplier invoice numbers treated as separate.
+
+Run the validation and API tests from the project root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest backend.test_validation backend.test_uploads
+```
+
 ## M2 structured extraction
 
 Set `OPENAI_API_KEY` in the API process environment for local Python, or place it in the ignored `.env` file for Docker Compose. Restart the API and worker after changing configuration. `OPENAI_MODEL` defaults to `gpt-4.1-mini`. Without a key, uploads still produce previews.

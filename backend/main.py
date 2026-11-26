@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt
+from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, validate_receipt
 
 logger = logging.getLogger(__name__)
 data_dir = Path(os.getenv("DATA_DIR", ".data")).resolve()
@@ -89,6 +90,46 @@ class ExtractionView(BaseModel):
     prompt_version: str
     latency_ms: int
     fields: ReceiptExtraction
+    validation: ValidationReport
+
+
+class SavedValidation(Base):
+    __tablename__ = "extraction_validations"
+
+    extraction_id: Mapped[str] = mapped_column(ForeignKey("extractions.id"), primary_key=True)
+    fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    invoice_identity: Mapped[str | None] = mapped_column(String)
+    report: Mapped[dict] = mapped_column(JSON)
+
+
+def validation_for(extraction_id: str, fields: ReceiptExtraction) -> SavedValidation:
+    report = validate_receipt(fields, today=datetime.now(timezone.utc).date())
+    return SavedValidation(
+        extraction_id=extraction_id, fingerprint=duplicate_fingerprint(fields, report),
+        invoice_identity=invoice_identity(fields.invoice_number) if fields.document_type == "invoice" else None,
+        report=report.model_dump(mode="json"),
+    )
+
+
+def report_with_duplicates(session: Session, saved: SavedValidation, receipt: Receipt) -> ValidationReport:
+    report = ValidationReport.model_validate(saved.report)
+    if saved.fingerprint is None:
+        return report
+    candidate = (
+        select(Receipt.id).join(SavedValidation, Receipt.attempt == SavedValidation.extraction_id)
+        .where(Receipt.user_id == receipt.user_id, Receipt.id != receipt.id, Receipt.status == "ready",
+               SavedValidation.fingerprint == saved.fingerprint)
+    )
+    if saved.invoice_identity is not None:
+        candidate = candidate.where(
+            (SavedValidation.invoice_identity == saved.invoice_identity) | SavedValidation.invoice_identity.is_(None),
+        )
+    if session.scalar(candidate.limit(1)) is not None:
+        report.flags.append(ValidationFlag(
+            field="document", code="possible_duplicate", severity="warning",
+            reason="Another document matches the merchant, date, currency, and total. Check whether this is a separate transaction.",
+        ))
+    return report
 
 
 @lru_cache
@@ -209,6 +250,8 @@ def process_receipt(receipt_id: str, attempt: str) -> None:
                 fields=extracted.fields.model_dump(), raw_json=extracted.raw_json,
                 latency_ms=extracted.latency_ms, created_at=datetime.now(timezone.utc),
             ))
+            session.flush()
+            session.add(validation_for(attempt, extracted.fields))
         session.commit()
 
 
@@ -298,6 +341,13 @@ def identify(data: bytes) -> str:
 async def lifespan(app: FastAPI):
     data_dir.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        pending = session.scalars(
+            select(Extraction).outerjoin(SavedValidation).where(SavedValidation.extraction_id.is_(None)),
+        )
+        for extraction in pending:
+            session.add(validation_for(extraction.id, ReceiptExtraction.model_validate(extraction.fields)))
+        session.commit()
     yield
 
 
@@ -418,7 +468,7 @@ def queue_again(receipt_id: str, tasks: BackgroundTasks, expected_status: str) -
 @app.get("/api/receipts/{receipt_id}/extraction")
 def receipt_extraction(receipt_id: str) -> ExtractionView:
     with Session(engine) as session:
-        get_receipt(session, receipt_id)
+        receipt = get_receipt(session, receipt_id)
         extraction = session.scalar(
             select(Extraction).where(Extraction.receipt_id == receipt_id)
             .order_by(Extraction.created_at.desc(), Extraction.id.desc()).limit(1)
@@ -428,4 +478,5 @@ def receipt_extraction(receipt_id: str) -> ExtractionView:
         return ExtractionView(
             id=extraction.id, model=extraction.model, prompt_version=extraction.prompt_version,
             latency_ms=extraction.latency_ms, fields=ReceiptExtraction.model_validate(extraction.fields),
+            validation=report_with_duplicates(session, session.get(SavedValidation, extraction.id), receipt),
         )
