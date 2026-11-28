@@ -13,16 +13,19 @@ from PIL import Image
 from sqlalchemy import create_engine
 
 from backend import main
+from backend.auth import Account, COOKIE, LoginSession, token_digest
 from backend.extraction import GEMINI_MODEL, ExtractionResult
 from backend.extraction_samples import SAMPLES, render_sample
 from backend.test_validation import invoice
 from backend.tracker import workspace_today
+from backend.transfer_legacy import transfer_legacy
 
 
 class UploadTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.dict(os.environ, {
             "EXTRACTION_PROVIDER": "", "GEMINI_API_KEY": "", "GEMINI_MODEL": "", "OPENAI_API_KEY": "",
+            "AUTH_COOKIE_SECURE": "false", "APP_ORIGINS": "http://127.0.0.1:5173",
         }))
         directory = self.enterContext(TemporaryDirectory())
         database = create_engine(f"sqlite:///{(Path(directory) / 'test.db').as_posix()}")
@@ -31,9 +34,99 @@ class UploadTests(unittest.TestCase):
             main, data_dir=Path(directory), engine=database, bucket=None, redis_url=None,
         ))
         self.client = self.enterContext(TestClient(main.app))
+        self.password = "synthetic login passphrase"
+        self.account = self.register_workspace(self.client, "owner@example.test", "First Workspace")
+
+    def register_workspace(self, client, email, name):
+        response = client.post("/api/auth/register", json={
+            "email": email, "password": self.password, "workspace_name": name,
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
 
     def upload(self, name, data):
         return self.client.post("/api/receipts", files={"file": (name, data)})
+
+    def test_sign_in_cookie_expiration_and_logout(self):
+        original_token = self.client.cookies.get(COOKIE)
+        self.assertEqual(self.client.get("/api/auth/me").json(), self.account)
+        with main.Session(main.engine) as session:
+            account = session.get(Account, self.account["id"])
+            self.assertNotEqual(account.password_hash, self.password)
+            self.assertIsNotNone(session.get(LoginSession, token_digest(original_token)))
+            self.assertIsNone(session.get(LoginSession, original_token))
+
+        self.assertEqual(self.client.post("/api/auth/logout", headers={"origin": "https://other.example.test"}).status_code, 403)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 200)
+        self.assertEqual(self.client.post("/api/auth/logout").status_code, 204)
+        self.assertEqual(self.client.get("/api/receipts").status_code, 401)
+        self.assertEqual(self.client.get("/api/auth/me", headers={"Cookie": f"{COOKIE}={original_token}"}).status_code, 401)
+
+        credentials = {"email": "OWNER@example.test", "password": self.password}
+        denied = self.client.post("/api/auth/login", json={**credentials, "password": "incorrect long password"})
+        self.assertEqual(denied.status_code, 401)
+        session = self.client.post("/api/auth/login", json=credentials)
+        self.assertEqual(session.status_code, 200, session.text)
+        self.assertIn("HttpOnly", session.headers["set-cookie"])
+        self.assertIn("SameSite=lax", session.headers["set-cookie"])
+        self.assertIn("no-store", session.headers["cache-control"])
+        with main.Session(main.engine) as database:
+            expired = database.get(LoginSession, token_digest(self.client.cookies.get(COOKIE)))
+            expired.expires_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+            database.commit()
+        self.assertEqual(self.client.get("/api/expenses").status_code, 401)
+
+    def test_workspaces_isolate_documents_reviews_expenses_and_exact_file_duplicates(self):
+        other = TestClient(main.app)
+        self.addCleanup(other.close)
+        other_account = self.register_workspace(other, "other@example.test", "Second Workspace")
+        self.assertNotEqual(self.account["workspace_id"], other_account["workspace_id"])
+        fields = invoice(document_date="2025-11-26", payment_status="paid", payment_date="2025-11-26",
+                         sources=[{"field": "total", "page": 2, "box": None}])
+        content = render_sample(SAMPLES[10])[0]
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}), patch.object(
+            main, "extract_receipt", return_value=ExtractionResult(fields, {}, "fixture", 2),
+        ):
+            first = self.upload("account-one.pdf", content)
+            second = other.post("/api/receipts", files={"file": ("account-two.pdf", content)})
+        self.assertEqual((first.status_code, second.status_code), (202, 202))
+        first_id, second_id = first.json()["id"], second.json()["id"]
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual([item["id"] for item in other.get("/api/receipts").json()], [second_id])
+
+        first_path = f"/api/receipts/{first_id}"
+        review = self.client.get(f"{first_path}/review").json()
+        version = review["version"]
+        self.assertEqual(self.client.post(f"{first_path}/approve", json=version).status_code, 200)
+        for path in ("", "/preview", "/original", "/extraction", "/review", "/review/source"):
+            response = other.get(first_path + path, params={"field": "total", "extraction_id": version["extraction_id"]})
+            self.assertEqual(response.status_code, 404, (path, response.text))
+        for path in ("/retry", "/extract", "/approve"):
+            self.assertEqual(other.post(first_path + path, json=version).status_code, 404)
+        self.assertEqual(other.patch(f"{first_path}/fields/merchant", json={**version, "value": "Other"}).status_code, 404)
+        self.assertEqual(other.get("/api/expenses").json()["expenses"], [])
+        self.assertEqual(len(self.client.get("/api/expenses").json()["expenses"]), 1)
+        self.assertEqual(list(DictReader(io.StringIO(other.get("/api/expenses/export.csv").text))), [])
+        self.assertEqual(other.patch(f"/api/expenses/{first_id}/category", json={"category": "Meals"}).status_code, 404)
+        self.assertEqual(other.post(f"/api/expenses/{first_id}/mark-paid", json={"paid_on": "2025-11-26"}).status_code, 404)
+        self.assertEqual(other.patch(f"/api/expenses/{first_id}/payment", json={
+            "previous_paid_on": "2025-11-26", "paid_on": "2025-11-27",
+        }).status_code, 404)
+        flags = other.get(f"/api/receipts/{second_id}/review").json()["validation"]["flags"]
+        self.assertFalse(any(flag["code"] == "possible_duplicate" for flag in flags))
+
+    def test_legacy_documents_stay_private_until_explicit_transfer(self):
+        content = render_sample(SAMPLES[0])[0]
+        receipt_id = self.upload("legacy.jpg", content).json()["id"]
+        with main.Session(main.engine) as session:
+            session.get(main.Receipt, receipt_id).workspace_id = "local-user"
+            session.commit()
+        self.assertEqual(self.client.get("/api/receipts").json(), [])
+        self.assertEqual(self.client.get(f"/api/receipts/{receipt_id}/original").status_code, 404)
+        with main.Session(main.engine) as session:
+            self.assertEqual(transfer_legacy(session, "OWNER@example.test"), 1)
+            session.commit()
+        self.assertEqual(self.client.get(f"/api/receipts/{receipt_id}/original").content, content)
 
     def test_photo_pdf_preview_duplicate_and_original(self):
         image = Image.new("RGB", (40, 70), "white")
