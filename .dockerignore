@@ -3,6 +3,8 @@
 backend/*
 !backend/Dockerfile
 !backend/main.py
+!backend/auth.py
+!backend/transfer_legacy.py
 !backend/extraction.py
 !backend/extraction_samples.py
 !backend/evaluation.py

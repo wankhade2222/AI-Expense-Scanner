@@ -1,5 +1,15 @@
 # AI Expense Scanner
 
+## Business workspaces and pilot
+
+Create a workspace from the sign-in screen, then sign in with the same email and password on another device. Each account has its own workspace. Upload history, previews, raw extractions, reviews, corrections, payment records, and CSV exports are scoped to that workspace. Use a passphrase of at least 15 characters.
+
+Receipts created before sign-in are kept in the original store. To move them into your workspace, create your account and run `docker compose exec api python -m backend.transfer_legacy --account-email YOUR_EMAIL`. Run this as the app operator against the database that holds the old receipts. The transfer preserves document IDs, files, and their linked expense history. If the destination already contains an identical upload, the transfer rolls back.
+
+For a small pilot, serve the built React app and `/api` on the same HTTPS staging origin. Set `APP_ORIGINS` to that origin and `AUTH_COOKIE_SECURE=true`. The local Compose setup binds the API to loopback and allows cookies over local HTTP. Use a separate pilot database and storage so test accounts and documents stay apart from the local demo.
+
+Have each freelancer create their own workspace. Use **Take photo** on a phone for a redacted receipt and upload a redacted supplier invoice as a PDF. Verify the fields in Review, confirm both, find the paid receipt in the month of payment, and record a payment for the invoice. Check the month and category totals against the CSV. Record device/browser, time to confirm, corrected fields, and any processing failures by sample label.
+
 ## M6 extraction evaluation
 
 Run `./.venv/Scripts/python.exe -m backend.evaluation --output .data/evaluation-fixture.json` to exercise the scoring and validation rules offline. The 23 synthetic cases reuse the M2 receipts and invoices and add a tax-inclusive receipt, an obscured total, and a deliberately wrong fixture response. The offline report measures the test fixtures.
@@ -51,6 +61,7 @@ Install Python 3.12 or 3.13 and Node.js 22.12 or newer. Run the following from t
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+$env:AUTH_COOKIE_SECURE = "false"
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
 ```
 
@@ -58,10 +69,10 @@ In a second terminal:
 
 ```powershell
 npm.cmd --prefix frontend ci
-npm.cmd --prefix frontend run dev
+npm.cmd --prefix frontend run dev -- --port 5173 --strictPort --configLoader runner
 ```
 
-Open the Local URL Vite prints. By default the API uses SQLite, local files under `.data/`, and in-process background preview jobs. M1 uses a single local identity. Keep the API and UI on loopback until real authentication is implemented.
+Open the Local URL Vite prints. By default the API uses SQLite, local files under `.data/`, and in-process background preview jobs. The HTTP cookie override above is for loopback development.
 
 ## PostgreSQL and Redis worker
 

@@ -12,13 +12,17 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import pypdfium2 as pdfium
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile, status
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Response, UploadFile, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import JSON, Date, DateTime, ForeignKey, String, UniqueConstraint, case, create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
+from backend.auth import AuthBase, CurrentAccount, Identity, LocalRateLimits, allowed_origin, router as auth_router
 from backend.extraction import PROMPT_VERSION, ExtractionError, ReceiptExtraction, extract_receipt, extraction_config
 from backend.validation import ValidationFlag, ValidationReport, duplicate_fingerprint, invoice_identity, parse_date, validate_receipt
 from backend.tracker import (
@@ -31,7 +35,6 @@ data_dir = Path(os.getenv("DATA_DIR", ".data")).resolve()
 database_url = os.getenv("DATABASE_URL", f"sqlite:///{(data_dir / 'scanner.db').as_posix()}")
 bucket = os.getenv("S3_BUCKET")
 redis_url = os.getenv("REDIS_URL")
-owner = "local-user"
 max_bytes = 20 * 1024 * 1024
 max_pixels = 30_000_000
 max_pdf_pages = 30
@@ -49,7 +52,8 @@ class Receipt(Base):
     __table_args__ = (UniqueConstraint("user_id", "sha256"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    user_id: Mapped[str] = mapped_column(String(80), index=True)
+    # Keep the storage column name so existing documents can be transferred explicitly.
+    workspace_id: Mapped[str] = mapped_column("user_id", String(80), index=True)
     filename: Mapped[str] = mapped_column(String(255))
     content_type: Mapped[str] = mapped_column(String(40))
     storage_key: Mapped[str] = mapped_column(String(100))
@@ -204,7 +208,7 @@ def report_with_duplicates(session: Session, saved: SavedValidation, receipt: Re
     candidate = (
         select(Receipt.id).join(SavedValidation, Receipt.attempt == SavedValidation.extraction_id)
         .outerjoin(Review, Review.extraction_id == SavedValidation.extraction_id)
-        .where(Receipt.user_id == receipt.user_id, Receipt.id != receipt.id, Receipt.status == "ready",
+        .where(Receipt.workspace_id == receipt.workspace_id, Receipt.id != receipt.id, Receipt.status == "ready",
                fingerprint == saved.fingerprint)
     )
     if saved.invoice_identity is not None:
@@ -384,21 +388,21 @@ def mark_stopped_job(job, connection) -> None:
     mark_job_failed(job, connection, None, None, None)
 
 
-def expire_jobs(session: Session, receipt_id: str | None = None) -> None:
+def expire_jobs(session: Session, workspace_id: str, receipt_id: str | None = None) -> None:
     now = datetime.now(timezone.utc)
     expired = (
         ((Receipt.status == "queued") & (Receipt.updated_at < now - timedelta(minutes=15)))
         | ((Receipt.status == "processing") & (Receipt.updated_at < now - timedelta(minutes=3)))
     )
-    statement = update(Receipt).where(Receipt.user_id == owner, expired)
+    statement = update(Receipt).where(Receipt.workspace_id == workspace_id, expired)
     if receipt_id is not None:
         statement = statement.where(Receipt.id == receipt_id)
     session.execute(statement.values(status="failed", error="Processing stopped. Retry to try again."))
     session.commit()
 
 
-def get_receipt(session: Session, receipt_id: str) -> Receipt:
-    receipt = session.scalar(select(Receipt).where(Receipt.id == receipt_id, Receipt.user_id == owner))
+def get_receipt(session: Session, receipt_id: str, workspace_id: str) -> Receipt:
+    receipt = session.scalar(select(Receipt).where(Receipt.id == receipt_id, Receipt.workspace_id == workspace_id))
     if receipt is None:
         raise HTTPException(404, "Document not found.")
     return receipt
@@ -431,6 +435,10 @@ def identify(data: bytes) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     data_dir.mkdir(parents=True, exist_ok=True)
+    app.state.engine = engine
+    app.state.auth_redis_url = redis_url
+    app.state.auth_rate_limits = LocalRateLimits()
+    AuthBase.metadata.create_all(engine)
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         pending = session.scalars(
@@ -443,18 +451,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Expense Scanner", lifespan=lifespan)
+app.include_router(auth_router)
+
+
+@app.middleware("http")
+async def protect_api(request: Request, call_next):
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    if request.method in {"POST", "PATCH", "PUT", "DELETE"} and not allowed_origin(request):
+        response = JSONResponse(status_code=403, content={"detail": "Request origin is not allowed."})
+    else:
+        response = await call_next(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/auth/"):
+        return JSONResponse(status_code=422, content={"detail": "Check the sign-in or registration fields."})
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.get("/api/receipts")
-def list_receipts() -> list[ReceiptView]:
+def list_receipts(account: CurrentAccount) -> list[ReceiptView]:
     with Session(engine) as session:
-        expire_jobs(session)
-        rows = session.scalars(select(Receipt).where(Receipt.user_id == owner).order_by(Receipt.created_at.desc()))
+        expire_jobs(session, account.workspace_id)
+        rows = session.scalars(select(Receipt).where(Receipt.workspace_id == account.workspace_id)
+                               .order_by(Receipt.created_at.desc()))
         return [view(receipt) for receipt in rows]
 
 
 @app.post("/api/receipts", status_code=status.HTTP_202_ACCEPTED)
-def upload(file: Annotated[UploadFile, File()], response: Response, tasks: BackgroundTasks) -> ReceiptView:
+def upload(file: Annotated[UploadFile, File()], response: Response, tasks: BackgroundTasks, account: CurrentAccount) -> ReceiptView:
     data = file.file.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise HTTPException(413, "Choose a file up to 20 MB.")
@@ -462,7 +492,7 @@ def upload(file: Annotated[UploadFile, File()], response: Response, tasks: Backg
     digest = hashlib.sha256(data).hexdigest()
     receipt_id, attempt = uuid4().hex, uuid4().hex
     key = f"originals/{receipt_id}"
-    existing_query = select(Receipt).where(Receipt.user_id == owner, Receipt.sha256 == digest)
+    existing_query = select(Receipt).where(Receipt.workspace_id == account.workspace_id, Receipt.sha256 == digest)
     now = datetime.now(timezone.utc)
 
     with Session(engine) as session:
@@ -472,7 +502,7 @@ def upload(file: Annotated[UploadFile, File()], response: Response, tasks: Backg
             return view(existing)
         store(key, data, content_type)
         session.add(Receipt(
-            id=receipt_id, user_id=owner, filename=(file.filename or "Untitled document").replace("\\", "/").split("/")[-1][:255],
+            id=receipt_id, workspace_id=account.workspace_id, filename=(file.filename or "Untitled document").replace("\\", "/").split("/")[-1][:255],
             content_type=content_type, size=len(data), storage_key=key, sha256=digest,
             status="queued", attempt=attempt, created_at=now, updated_at=now,
         ))
@@ -488,7 +518,7 @@ def upload(file: Annotated[UploadFile, File()], response: Response, tasks: Backg
             return view(existing)
 
     start_job(tasks, receipt_id, attempt)
-    return receipt_details(receipt_id)
+    return receipt_details(receipt_id, account)
 
 
 def start_job(tasks: BackgroundTasks, receipt_id: str, attempt: str) -> None:
@@ -499,28 +529,28 @@ def start_job(tasks: BackgroundTasks, receipt_id: str, attempt: str) -> None:
 
 
 @app.get("/api/receipts/{receipt_id}")
-def receipt_details(receipt_id: str) -> ReceiptView:
+def receipt_details(receipt_id: str, account: CurrentAccount) -> ReceiptView:
     with Session(engine) as session:
-        expire_jobs(session, receipt_id)
-        return view(get_receipt(session, receipt_id))
+        expire_jobs(session, account.workspace_id, receipt_id)
+        return view(get_receipt(session, receipt_id, account.workspace_id))
 
 
 @app.get("/api/receipts/{receipt_id}/preview")
-def receipt_preview(receipt_id: str) -> Response:
+def receipt_preview(receipt_id: str, account: CurrentAccount) -> Response:
     with Session(engine) as session:
-        receipt = get_receipt(session, receipt_id)
+        receipt = get_receipt(session, receipt_id, account.workspace_id)
         if receipt.status not in ("ready", "failed") or receipt.page_count is None:
             raise HTTPException(404, "Preview is not available yet.")
         return Response(
             load(preview_key(receipt.id, receipt.attempt)),
-            media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"},
+            media_type="image/jpeg",
         )
 
 
 @app.get("/api/receipts/{receipt_id}/original")
-def receipt_original(receipt_id: str) -> Response:
+def receipt_original(receipt_id: str, account: CurrentAccount) -> Response:
     with Session(engine) as session:
-        receipt = get_receipt(session, receipt_id)
+        receipt = get_receipt(session, receipt_id, account.workspace_id)
         return Response(
             load(receipt.storage_key), media_type=receipt.content_type,
             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(receipt.filename, safe='')}"},
@@ -528,44 +558,45 @@ def receipt_original(receipt_id: str) -> Response:
 
 
 @app.post("/api/receipts/{receipt_id}/retry", status_code=status.HTTP_202_ACCEPTED)
-def retry(receipt_id: str, tasks: BackgroundTasks) -> ReceiptView:
-    return queue_again(receipt_id, tasks, "failed")
+def retry(receipt_id: str, tasks: BackgroundTasks, account: CurrentAccount) -> ReceiptView:
+    return queue_again(receipt_id, tasks, account, "failed")
 
 
 @app.post("/api/receipts/{receipt_id}/extract", status_code=status.HTTP_202_ACCEPTED)
-def extract_again(receipt_id: str, tasks: BackgroundTasks) -> ReceiptView:
-    try:
-        config = extraction_config()
-    except ExtractionError as exc:
-        raise HTTPException(503, str(exc)) from exc
-    if config is None:
-        raise HTTPException(503, "Set the API key for the selected extraction provider.")
-    return queue_again(receipt_id, tasks, "ready")
+def extract_again(receipt_id: str, tasks: BackgroundTasks, account: CurrentAccount) -> ReceiptView:
+    return queue_again(receipt_id, tasks, account, "ready")
 
 
-def queue_again(receipt_id: str, tasks: BackgroundTasks, expected_status: str) -> ReceiptView:
+def queue_again(receipt_id: str, tasks: BackgroundTasks, account: Identity, expected_status: str) -> ReceiptView:
     attempt = uuid4().hex
     with Session(engine) as session:
-        expire_jobs(session, receipt_id)
-        lock_receipt(session, receipt_id)
+        expire_jobs(session, account.workspace_id, receipt_id)
+        lock_receipt(session, receipt_id, account.workspace_id)
         if session.get(Expense, receipt_id) is not None:
             raise HTTPException(409, "This document has already been confirmed.")
+        if expected_status == "ready":
+            try:
+                config = extraction_config()
+            except ExtractionError as exc:
+                raise HTTPException(503, str(exc)) from exc
+            if config is None:
+                raise HTTPException(503, "Set the API key for the selected extraction provider.")
         changed = session.execute(
             update(Receipt)
-            .where(Receipt.id == receipt_id, Receipt.user_id == owner, Receipt.status == expected_status)
+            .where(Receipt.id == receipt_id, Receipt.workspace_id == account.workspace_id, Receipt.status == expected_status)
             .values(status="queued", attempt=attempt, page_count=None, error=None, updated_at=datetime.now(timezone.utc))
         ).rowcount
         if not changed:
             raise HTTPException(409, "This document cannot be queued in its current state.")
         session.commit()
     start_job(tasks, receipt_id, attempt)
-    return receipt_details(receipt_id)
+    return receipt_details(receipt_id, account)
 
 
 @app.get("/api/receipts/{receipt_id}/extraction")
-def receipt_extraction(receipt_id: str) -> ExtractionView:
+def receipt_extraction(receipt_id: str, account: CurrentAccount) -> ExtractionView:
     with Session(engine) as session:
-        receipt = get_receipt(session, receipt_id)
+        receipt = get_receipt(session, receipt_id, account.workspace_id)
         extraction = session.scalar(
             select(Extraction).where(Extraction.receipt_id == receipt_id)
             .order_by(Extraction.created_at.desc(), Extraction.id.desc()).limit(1)
@@ -579,18 +610,18 @@ def receipt_extraction(receipt_id: str) -> ExtractionView:
         )
 
 
-def lock_receipt(session: Session, receipt_id: str) -> None:
+def lock_receipt(session: Session, receipt_id: str, workspace_id: str) -> None:
     # A write locks the same receipt row for review edits, confirmation, and re-extraction.
     changed = session.execute(
-        update(Receipt).where(Receipt.id == receipt_id, Receipt.user_id == owner)
+        update(Receipt).where(Receipt.id == receipt_id, Receipt.workspace_id == workspace_id)
         .values(updated_at=Receipt.updated_at),
     ).rowcount
     if not changed:
         raise HTTPException(404, "Document not found.")
 
 
-def load_review(session: Session, receipt_id: str) -> tuple[Receipt, Review | None, ReviewView]:
-    receipt = get_receipt(session, receipt_id)
+def load_review(session: Session, receipt_id: str, workspace_id: str) -> tuple[Receipt, Review | None, ReviewView]:
+    receipt = get_receipt(session, receipt_id, workspace_id)
     expense = session.get(Expense, receipt_id)
     extraction = session.get(Extraction, receipt.attempt)
     if receipt.status != "ready" or extraction is None:
@@ -613,16 +644,16 @@ def check_version(current: ReviewView, expected: ReviewVersion) -> None:
 
 
 @app.get("/api/receipts/{receipt_id}/review")
-def receipt_review(receipt_id: str) -> ReviewView:
+def receipt_review(receipt_id: str, account: CurrentAccount) -> ReviewView:
     with Session(engine) as session:
-        return load_review(session, receipt_id)[2]
+        return load_review(session, receipt_id, account.workspace_id)[2]
 
 
 @app.patch("/api/receipts/{receipt_id}/fields/{field}")
-def edit_field(receipt_id: str, field: str, edit: EditRequest) -> ReviewView:
+def edit_field(receipt_id: str, field: str, edit: EditRequest, account: CurrentAccount) -> ReviewView:
     with Session(engine) as session:
-        lock_receipt(session, receipt_id)
-        _, review, current = load_review(session, receipt_id)
+        lock_receipt(session, receipt_id, account.workspace_id)
+        _, review, current = load_review(session, receipt_id, account.workspace_id)
         check_version(current, edit)
         if current.confirmed:
             raise HTTPException(409, "This document has already been confirmed.")
@@ -660,20 +691,20 @@ def edit_field(receipt_id: str, field: str, edit: EditRequest) -> ReviewView:
         review.revision, review.fields = revision, fields
         review.fingerprint, review.invoice_identity = validation.fingerprint, validation.invoice_identity
         session.add(Correction(
-            id=uuid4().hex, extraction_id=edit.extraction_id, user_id=owner, revision=revision,
+            id=uuid4().hex, extraction_id=edit.extraction_id, user_id=account.id, revision=revision,
             field=field, previous_value=previous, new_value=value, created_at=datetime.now(timezone.utc),
         ))
         session.flush()
-        response = load_review(session, receipt_id)[2]
+        response = load_review(session, receipt_id, account.workspace_id)[2]
         session.commit()
         return response
 
 
 @app.post("/api/receipts/{receipt_id}/approve")
-def approve_receipt(receipt_id: str, version: ApprovalRequest) -> ReviewView:
+def approve_receipt(receipt_id: str, version: ApprovalRequest, account: CurrentAccount) -> ReviewView:
     with Session(engine) as session:
-        lock_receipt(session, receipt_id)
-        _, _, current = load_review(session, receipt_id)
+        lock_receipt(session, receipt_id, account.workspace_id)
+        _, _, current = load_review(session, receipt_id, account.workspace_id)
         check_version(current, version)
         if current.confirmed:
             return current
@@ -700,9 +731,9 @@ def approve_receipt(receipt_id: str, version: ApprovalRequest) -> ReviewView:
 
 
 @app.get("/api/receipts/{receipt_id}/review/source")
-def review_source(receipt_id: str, field: str, extraction_id: str) -> Response:
+def review_source(receipt_id: str, field: str, extraction_id: str, account: CurrentAccount) -> Response:
     with Session(engine) as session:
-        receipt, _, review = load_review(session, receipt_id)
+        receipt, _, review = load_review(session, receipt_id, account.workspace_id)
         if review.version.extraction_id != extraction_id:
             raise HTTPException(409, "The review changed. Reload it before continuing.")
         locations = [source for source in review.fields.sources if source.field == field]
@@ -741,7 +772,7 @@ def expense_view(expense: Expense, tracking: ExpenseTracking | None, *, today: d
 
 
 def filtered_expenses(
-    session: Session, payment_status: str, month: str | None, category: str | None, *, today: date,
+    session: Session, workspace_id: str, payment_status: str, month: str | None, category: str | None, *, today: date,
 ) -> list[TrackerExpense]:
     if month is not None:
         if payment_status != "paid":
@@ -754,7 +785,7 @@ def filtered_expenses(
         validate_category(category)
     rows = session.execute(
         select(Expense, ExpenseTracking).join(Receipt, Expense.receipt_id == Receipt.id)
-        .outerjoin(ExpenseTracking).where(Receipt.user_id == owner)
+        .outerjoin(ExpenseTracking).where(Receipt.workspace_id == workspace_id)
     )
     expenses = []
     for expense, tracking in rows:
@@ -769,27 +800,27 @@ def filtered_expenses(
 
 
 @app.get("/api/expenses")
-def list_expenses(status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> ExpenseReport:
+def list_expenses(account: CurrentAccount, status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> ExpenseReport:
     today = workspace_today()
     month = today.isoformat()[:7] if month == "current" else month
     with Session(engine) as session:
-        return summarize(filtered_expenses(session, status, month, category, today=today), today=today, month=month)
+        return summarize(filtered_expenses(session, account.workspace_id, status, month, category, today=today), today=today, month=month)
 
 
 @app.get("/api/expenses/export.csv")
-def export_expenses(status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> Response:
+def export_expenses(account: CurrentAccount, status: Literal["paid", "unpaid"] = "paid", month: str | None = None, category: str | None = None) -> Response:
     today = workspace_today()
     month = today.isoformat()[:7] if month == "current" else month
     with Session(engine) as session:
-        rows = filtered_expenses(session, status, month, category, today=today)
+        rows = filtered_expenses(session, account.workspace_id, status, month, category, today=today)
     return Response(
         expense_csv(rows), media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="expenses.csv"', "Cache-Control": "private, no-store"},
     )
 
 
-def lock_expense(session: Session, receipt_id: str) -> tuple[Expense, ExpenseTracking]:
-    lock_receipt(session, receipt_id)
+def lock_expense(session: Session, receipt_id: str, workspace_id: str) -> tuple[Expense, ExpenseTracking]:
+    lock_receipt(session, receipt_id, workspace_id)
     expense = session.get(Expense, receipt_id)
     if expense is None:
         raise HTTPException(404, "Confirmed expense not found.")
@@ -801,16 +832,16 @@ def lock_expense(session: Session, receipt_id: str) -> tuple[Expense, ExpenseTra
 
 
 @app.post("/api/expenses/{receipt_id}/mark-paid")
-def mark_paid(receipt_id: str, request: PaymentRequest) -> TrackerExpense:
-    return save_payment(receipt_id, request)
+def mark_paid(receipt_id: str, request: PaymentRequest, account: CurrentAccount) -> TrackerExpense:
+    return save_payment(receipt_id, request, account)
 
 
 @app.patch("/api/expenses/{receipt_id}/payment")
-def correct_payment(receipt_id: str, request: PaymentCorrectionRequest) -> TrackerExpense:
-    return save_payment(receipt_id, request, previous_paid_on=request.previous_paid_on)
+def correct_payment(receipt_id: str, request: PaymentCorrectionRequest, account: CurrentAccount) -> TrackerExpense:
+    return save_payment(receipt_id, request, account, previous_paid_on=request.previous_paid_on)
 
 
-def save_payment(receipt_id: str, request: PaymentRequest, previous_paid_on: str | None = None) -> TrackerExpense:
+def save_payment(receipt_id: str, request: PaymentRequest, account: Identity, previous_paid_on: str | None = None) -> TrackerExpense:
     try:
         paid_on = parse_date(request.paid_on)
     except ValueError as exc:
@@ -819,7 +850,7 @@ def save_payment(receipt_id: str, request: PaymentRequest, previous_paid_on: str
     if paid_on > today:
         raise HTTPException(422, "A completed payment cannot have a future date.")
     with Session(engine) as session:
-        expense, tracking = lock_expense(session, receipt_id)
+        expense, tracking = lock_expense(session, receipt_id, account.workspace_id)
         current = expense_view(expense, tracking, today=today)
         if current.paid_on == paid_on:
             return current
@@ -831,7 +862,7 @@ def save_payment(receipt_id: str, request: PaymentRequest, previous_paid_on: str
             raise HTTPException(422, "Confirm that this payment was made before the document date.")
         tracking.paid_on = paid_on
         session.add(ExpensePaymentChange(
-            id=uuid4().hex, receipt_id=receipt_id, user_id=owner, previous_paid_on=current.paid_on,
+            id=uuid4().hex, receipt_id=receipt_id, user_id=account.id, previous_paid_on=current.paid_on,
             paid_on=paid_on, prepayment=prepayment, created_at=datetime.now(timezone.utc),
         ))
         result = expense_view(expense, tracking, today=today)
@@ -840,10 +871,10 @@ def save_payment(receipt_id: str, request: PaymentRequest, previous_paid_on: str
 
 
 @app.patch("/api/expenses/{receipt_id}/category")
-def change_category(receipt_id: str, request: CategoryRequest) -> TrackerExpense:
+def change_category(receipt_id: str, request: CategoryRequest, account: CurrentAccount) -> TrackerExpense:
     validate_category(request.category)
     with Session(engine) as session:
-        expense, tracking = lock_expense(session, receipt_id)
+        expense, tracking = lock_expense(session, receipt_id, account.workspace_id)
         tracking.category = request.category
         result = expense_view(expense, tracking, today=workspace_today())
         session.commit()

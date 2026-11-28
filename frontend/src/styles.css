@@ -14,6 +14,16 @@ button:disabled { opacity: .6; cursor: wait; }
 .sidebar { background: #122b27; padding: 29px 19px; color: #f2fbf8; }
 .brand { display: flex; align-items: center; gap: 11px; font-weight: 730; font-size: 1rem; white-space: nowrap; }
 .brand-icon { width: 37px; height: 37px; background: #2c554a; border-radius: 10px; display: grid; place-items: center; color: #a4edcd; }
+.access-page { display: grid; min-height: 100vh; place-items: center; }
+.access-card { width: min(100%, 460px); padding: clamp(20px, 5vw, 34px); background: #fff; border: 1px solid #dbe6e1; border-radius: 14px; }
+.access-card h1 { font-size: clamp(1.6rem, 5vw, 2rem); margin: 16px 0; }
+.access-card form { display: grid; gap: 13px; margin-bottom: 14px; }
+.access-card label { display: grid; gap: 5px; font-weight: 600; }
+.access-card input { min-height: 42px; min-width: 0; padding: 8px 10px; border: 1px solid #9eafa9; border-radius: 7px; font: inherit; }
+.access-card .message { margin: 0; }
+.workspace-account { border-top: 1px solid #386052; margin-top: 26px; padding-top: 15px; display: grid; justify-items: start; gap: 9px; overflow-wrap: anywhere; }
+.workspace-account button { background: #22463d; border-color: #568175; color: #e4fbf2; }
+.workspace-account button:hover:not(:disabled) { background: #31594e; }
 nav { margin-top: 44px; }
 nav a + a { margin-top: 5px; }
 nav a:not([aria-current]) { background: transparent; color: #c5ded5; }
@@ -117,6 +127,7 @@ dialog::backdrop { background: #0e211dc0; }
 @media (max-width: 700px) {
   .layout { display: block; }
   .sidebar { padding: 13px 18px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  .workspace-account { width: 100%; margin: 0; padding-top: 7px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; }
   nav { margin: 0; display: flex; flex-wrap: wrap; gap: 3px; }
   nav a + a { margin: 0; }
   nav a { padding: 8px; }

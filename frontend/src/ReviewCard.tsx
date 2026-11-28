@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { workspaceFetch } from './api'
 
 type Flag = {
   field: string
@@ -52,14 +53,14 @@ export default function ReviewCard({ receiptId, onProcessingChanged }: { receipt
 
   useEffect(() => {
     const controller = new AbortController()
-    const fetchReview = () => fetch(`${base}/review`, { signal: controller.signal })
+    const fetchReview = () => workspaceFetch(`${base}/review`, { signal: controller.signal })
     let timer: number | undefined
     let wasProcessing = false
     async function load() {
       try {
         let response = await fetchReview()
         if (response.status === 404) {
-          const receipt = await fetch(base, { signal: controller.signal })
+          const receipt = await workspaceFetch(base, { signal: controller.signal })
           if (!receipt.ok) throw new Error('Could not load the document status.')
           const state: Processing = await receipt.json()
           if (controller.signal.aborted) return
@@ -101,7 +102,7 @@ export default function ReviewCard({ receiptId, onProcessingChanged }: { receipt
     setBusy(true)
     setError('')
     try {
-      const response = await fetch(`${base}/${processing.status === 'failed' ? 'retry' : 'extract'}`, { method: 'POST' })
+      const response = await workspaceFetch(`${base}/${processing.status === 'failed' ? 'retry' : 'extract'}`, { method: 'POST' })
       if (!response.ok) {
         const payload = await response.json().catch(() => null)
         throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Could not queue extraction.')
@@ -120,7 +121,7 @@ export default function ReviewCard({ receiptId, onProcessingChanged }: { receipt
     setBusy(true)
     setError('')
     try {
-      const response = await fetch(`${base}${path}`, {
+      const response = await workspaceFetch(`${base}${path}`, {
         method, headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...review.version, ...data }),
       })

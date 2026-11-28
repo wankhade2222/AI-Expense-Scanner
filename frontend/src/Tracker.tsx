@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Download } from 'lucide-react'
+import { workspaceFetch } from './api'
 
 type Expense = {
   receipt_id: string
@@ -49,7 +50,7 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
     const controller = new AbortController()
     async function load() {
       try {
-        const response = await fetch(`/api/expenses?${query}`, { signal: controller.signal })
+        const response = await workspaceFetch(`/api/expenses?${query}`, { signal: controller.signal })
         if (!response.ok) throw new Error('Could not load the tracker.')
         const data: Report = await response.json()
         if (!controller.signal.aborted) {
@@ -83,7 +84,7 @@ export default function Tracker({ mode }: { mode: 'bills' | 'spending' }) {
     setError('')
     setNotice('')
     try {
-      const response = await fetch(`/api/expenses/${expense.receipt_id}/${action}`, {
+      const response = await workspaceFetch(`/api/expenses/${expense.receipt_id}/${action}`, {
         method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       })
       if (!response.ok) {

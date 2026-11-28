@@ -4,6 +4,8 @@ import { AlertCircle, BarChart3, Camera, CheckCircle2, Clock3, FileText, FolderO
 import './styles.css'
 import ReviewCard from './ReviewCard'
 import Tracker from './Tracker'
+import SignIn, { authError, type WorkspaceIdentity } from './SignIn'
+import { sessionExpired, workspaceFetch } from './api'
 
 type Receipt = {
   id: string
@@ -28,7 +30,7 @@ const pages = [
 const activePage = () => pages.find(item => `#${item.id}` === window.location.hash)?.id ?? 'documents'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`/api/receipts${path}`, options)
+  const response = await workspaceFetch(`/api/receipts${path}`, options)
   if (!response.ok) {
     const body = await response.json().catch(() => null)
     throw new Error(typeof body?.detail === 'string' ? body.detail : 'Could not reach the scanner. Try again.')
@@ -45,7 +47,7 @@ function Status({ status }: { status: Receipt['status'] }) {
   return <span className={`status ${status}`}><Icon size={14} />{statusLabels[status]}</span>
 }
 
-function App() {
+function WorkspaceApp({ account, onSignOut }: { account: WorkspaceIdentity; onSignOut: () => void }) {
   const [page, setPage] = useState(activePage)
   const [receipts, setReceipts] = useState<Receipt[]>([])
   const [loading, setLoading] = useState(true)
@@ -56,10 +58,27 @@ function App() {
   const [notice, setNotice] = useState('')
   const [selected, setSelected] = useState<Receipt | null>(null)
   const [retrying, setRetrying] = useState<string | null>(null)
+  const [signingOut, setSigningOut] = useState(false)
+  const [signOutError, setSignOutError] = useState('')
   const picker = useRef<HTMLInputElement>(null)
   const camera = useRef<HTMLInputElement>(null)
   const dialog = useRef<HTMLDialogElement>(null)
   const processing = receipts.some(({ status }) => status === 'queued' || status === 'processing')
+
+  async function signOut() {
+    if (signingOut) return
+    setSigningOut(true)
+    setSignOutError('')
+    try {
+      const response = await fetch('/api/auth/logout', { method: 'POST' })
+      if (!response.ok) throw new Error(await authError(response))
+      onSignOut()
+    } catch (problem) {
+      setSignOutError(describeError(problem))
+    } finally {
+      setSigningOut(false)
+    }
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -142,6 +161,11 @@ function App() {
         <nav aria-label="Workspace">
           {pages.map(({ id, label, icon: Icon }) => <a key={id} href={`#${id}`} aria-current={page === id ? 'page' : undefined}><Icon size={19} />{label}</a>)}
         </nav>
+        <div className="workspace-account">
+          <strong>{account.workspace_name}</strong>
+          <button type="button" onClick={() => void signOut()} disabled={signingOut}>Sign out</button>
+          {signOutError && <p role="alert">{signOutError}</p>}
+        </div>
       </aside>
       {page === 'documents' ? <main id="documents">
         <header>
@@ -226,6 +250,47 @@ function App() {
       </main> : <Tracker key={page} mode={page} />}
     </div>
   )
+}
+
+function App() {
+  const [account, setAccount] = useState<WorkspaceIdentity | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [attempt, setAttempt] = useState(0)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    async function loadIdentity() {
+      try {
+        const response = await fetch('/api/auth/me', { signal: controller.signal })
+        if (response.status === 401) return
+        if (!response.ok) throw new Error(await authError(response))
+        const identity = await response.json()
+        if (!controller.signal.aborted) setAccount(identity)
+      } catch (problem) {
+        if (!controller.signal.aborted) setError(describeError(problem))
+      } finally {
+        if (!controller.signal.aborted) setLoading(false)
+      }
+    }
+    void loadIdentity()
+    return () => controller.abort()
+  }, [attempt])
+
+  useEffect(() => {
+    const signOut = () => setAccount(null)
+    window.addEventListener(sessionExpired, signOut)
+    return () => window.removeEventListener(sessionExpired, signOut)
+  }, [])
+
+  if (loading) return <main><p role="status">Checking your session…</p></main>
+  if (error) return <main><p role="alert">{error}</p><button onClick={() => {
+    setError('')
+    setLoading(true)
+    setAttempt(value => value + 1)
+  }}>Retry</button></main>
+  return account ? <WorkspaceApp key={account.id} account={account} onSignOut={() => setAccount(null)} /> :
+    <SignIn onSignedIn={setAccount} />
 }
 
 createRoot(document.getElementById('root')!).render(<App />)
